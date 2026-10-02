@@ -1,0 +1,119 @@
+{
+  "name": "pi-desktop",
+  "version": "0.2.1",
+  "private": true,
+  "description": "Unofficial Windows desktop GUI client for Pi Coding Agent",
+  "homepage": "https://github.com/xiaoshanshi017-bot/pi-desktop#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xiaoshanshi017-bot/pi-desktop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xiaoshanshi017-bot/pi-desktop/issues"
+  },
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "desktop-client",
+    "electron",
+    "windows"
+  ],
+  "author": "Pi Desktop",
+  "license": "MIT",
+  "main": "dist-electron/main.cjs",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:ui": "vite --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build && node scripts/build-electron.mjs",
+    "start": "node scripts/start.mjs",
+    "prepare:runtime": "node scripts/prepare-runtime.mjs",
+    "test": "tsx --test tests/*.test.ts",
+    "pack": "npm run prepare:runtime && npm run build && electron-builder --win dir",
+    "dist": "npm run prepare:runtime && npm run build && electron-builder --win nsis portable"
+  },
+  "dependencies": {
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "lucide-react": "^0.468.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "rehype-highlight": "^7.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^4.7.0",
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3",
+    "esbuild": "^0.25.9",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vite": "^6.3.6"
+  },
+  "build": {
+    "appId": "local.pi.desktop",
+    "productName": "Pi Desktop",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "build/icon.png",
+      "LICENSE",
+      "ATTRIBUTIONS.md",
+      "package.json"
+    ],
+    "asar": true,
+    "beforePack": "scripts/verify-runtime.cjs",
+    "extraResources": [
+      {
+        "from": "build/runtime/win32-x64",
+        "to": "runtime",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "electron/pi-launcher.mjs",
+        "to": "runtime/pi-launcher.mjs"
+      }
+    ],
+    "electronDist": "node_modules/electron/dist",
+    "npmRebuild": false,
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "Pi-Desktop-${version}-${arch}.exe"
+    },
+    "nsis": {
+      "artifactName": "Pi-Desktop-Setup-${version}-${arch}.exe",
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": false
+    }
+  }
+}
