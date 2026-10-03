@@ -19,7 +19,10 @@ const runtime = path.join(path.dirname(executable), 'resources', 'runtime');
 const report = { started: new Date().toISOString(), profile: qaRoot, checks: [], errors: [], versions: {}, success: false };
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const key = value => path.resolve(value).toLowerCase();
-const withinRuntime = value => key(value).startsWith(key(runtime) + path.sep);
+// A local update may share the verified runtime through a directory junction.
+// Compare physical paths so Git Bash's canonical executable path has the same
+// ownership check as Node's path through the alias.
+const withinRuntime = value => key(fs.realpathSync(value)).startsWith(key(fs.realpathSync(runtime)) + path.sep);
 let window;
 let started = false;
 let finishing = false;

@@ -13,6 +13,7 @@ module.exports = async context => {
   }
   await assertRuntimeTree(runtime);
   if (!(await stat(path.join(project, 'electron', 'pi-launcher.mjs'))).isFile()) throw new Error('Missing bundled Pi launcher.');
+  if (!(await stat(path.join(project, 'electron', 'desktop-command-guard.mjs'))).isFile()) throw new Error('Missing bundled Pi command timeout extension.');
   let manifest;
   try { manifest = JSON.parse(await readFile(path.join(runtime, 'manifest.json'), 'utf8')); }
   catch { throw new Error('Bundled runtime is missing. Run npm run prepare:runtime before packaging.'); }

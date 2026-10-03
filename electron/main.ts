@@ -1,31 +1,28 @@
 import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { basename, extname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Connection, FileAttachment, Preferences, RpcRecord } from '../shared/types';
+import { desktopProgressGuidance } from '../shared/progress-guidance';
 import { discoverDiagnostics } from './diagnostics';
 import { createPiLaunchOptions } from './runtime';
 import { readModelConfigSummary } from './model-config';
 import { importProjects, previewProjectMigration } from './project-migration';
 import { resolveSessionRestore } from './session-restore';
+import { ConnectionPool, type ManagedConnection } from './connections';
 import { PiRpcClient } from './rpc';
-import { listSessions, PreferenceStore, readSessionInfo, samePath } from './storage';
+import { listSessions, PreferenceStore, readSessionHeader, readSessionInfo, samePath } from './storage';
 
 if (process.env.PI_DESKTOP_USER_DATA) app.setPath('userData', resolve(process.env.PI_DESKTOP_USER_DATA));
 app.setName('Pi Desktop');
 let window: BrowserWindow | null = null;
-let client: PiRpcClient | undefined;
-let currentProject: string | undefined;
-let connecting = false;
-let rpcMutation = false;
-let sessionRevision = 0;
+let connections: ConnectionPool;
 let allowClose = false;
 let closePending = false;
 let store: PreferenceStore;
 const expectedVersion = '0.84.2';
 const devUrl = process.env.PI_DESKTOP_DEV_URL;
 const runtimeRoot = app.isPackaged ? join(process.resourcesPath, 'runtime') : join(app.getAppPath(), 'build', 'runtime', 'win32-x64');
-const sessionCommands = new Set(['new_session', 'switch_session', 'fork', 'clone']);
 const commands = new Set([
   'prompt', 'steer', 'follow_up', 'abort', 'new_session', 'get_state', 'get_messages',
   'set_model', 'cycle_model', 'get_available_models', 'set_thinking_level', 'cycle_thinking_level',
@@ -63,13 +60,6 @@ function validSender(event: IpcMainInvokeEvent): void {
 function handle(channel: string, callback: (...args: any[]) => unknown): void {
   ipcMain.handle(channel, (event, ...args) => { validSender(event); return callback(...args); });
 }
-function requireClient(): PiRpcClient {
-  if (!client?.running) throw new Error('请先打开项目并连接 Pi。');
-  return client;
-}
-function assertIdle(): void {
-  if (connecting || rpcMutation || client?.busy) throw new Error('Pi 正在执行任务或切换会话，请等待完成后再操作。');
-}
 function text(value: unknown, name: string, max = 32_768): string {
   if (typeof value !== 'string' || !value.trim() || value.length > max) throw new Error(`${name}无效。`);
   return value;
@@ -79,76 +69,90 @@ async function projectPath(value: unknown): Promise<string> {
   if (!(await stat(path)).isDirectory()) throw new Error('项目路径必须是文件夹。');
   return path;
 }
-async function rememberSession(active: PiRpcClient, state?: RpcRecord, revision = sessionRevision): Promise<void> {
-  if (client !== active || !currentProject || revision !== sessionRevision) return;
-  const project = currentProject;
-  const snapshot = state ?? await active.request({ type: 'get_state' });
-  if (client !== active || currentProject !== project || revision !== sessionRevision || typeof snapshot.sessionFile !== 'string') return;
+async function rememberSession(active: ManagedConnection, snapshot: RpcRecord, revision: number): Promise<void> {
+  if (active.closing || revision !== active.revision || !connections.isLatestSelection(active) || typeof snapshot.sessionFile !== 'string') return;
+  const project = active.project;
   const prefs = store.get();
   if (prefs.lastSessions?.[project] !== snapshot.sessionFile) {
     // Pi assigns a session filename before the first durable message exists.
     // Do not save an uncreated session as a restore target.
-    if (!(await readSessionInfo(snapshot.sessionFile, project)) || client !== active || currentProject !== project || revision !== sessionRevision) return;
+    if (!(await readSessionInfo(snapshot.sessionFile, project)) || active.closing || revision !== active.revision || !connections.isLatestSelection(active)) return;
     await store.save({ lastSessions: { ...store.get().lastSessions, [project]: snapshot.sessionFile } });
   }
 }
-async function connect(projectValue: unknown, sessionValue?: unknown): Promise<Connection> {
-  assertIdle();
-  connecting = true;
-  sessionRevision++;
-  let candidate: PiRpcClient | undefined;
-  try {
-    const project = await projectPath(projectValue);
-    const requestedSession = sessionValue === undefined ? undefined : resolve(text(sessionValue, '会话路径'));
-    const restored = await resolveSessionRestore(project, requestedSession);
-    const sessionPath = restored.sessionPath;
-    const diagnostics = await discoverDiagnostics(store.get(), { runtimeRoot, packaged: app.isPackaged, projectDir: project });
-    if (diagnostics.errors.length || !diagnostics.piPath || !diagnostics.nodePath) throw new Error(diagnostics.errors.join('\n'));
-    const launch = await createPiLaunchOptions(diagnostics, runtimeRoot, ['--mode', 'rpc', ...(sessionPath ? ['--session', sessionPath] : [])], {
-      developmentLauncher: app.isPackaged ? undefined : join(app.getAppPath(), 'electron', 'pi-launcher.mjs'),
-    });
-    if (client) await client.stop();
-    client = undefined;
-    currentProject = project;
-    emit({ type: 'connection_status', status: 'connecting', project });
-    candidate = new PiRpcClient({
-      executable: launch.executable,
-      args: launch.args,
-      cwd: project,
-      env: { ...launch.env, FORCE_COLOR: '0', NO_COLOR: '1' },
-      requestTimeoutMs: 60_000,
-      onEvent: event => {
-        if (client !== candidate) return;
-        emit({ ...event, ...(event.type === 'connection_status' ? { project } : {}) });
-        if (event.type === 'agent_settled') void rememberSession(candidate!).catch(() => {});
-      },
-    });
-    client = candidate;
-    candidate.start();
-    const [state, messages, models, commandList, stats] = await Promise.all([
-      candidate.request({ type: 'get_state' }), candidate.request({ type: 'get_messages' }),
-      candidate.request({ type: 'get_available_models' }), candidate.request({ type: 'get_commands' }),
-      candidate.request({ type: 'get_session_stats' }),
-    ]);
-    const persisted = typeof state.sessionFile === 'string' && await readSessionInfo(state.sessionFile, project);
-    await store.opened(project, persisted ? state.sessionFile : undefined);
-    if (restored.missing) {
-      const lastSessions = { ...store.get().lastSessions };
-      for (const [savedProject, savedSession] of Object.entries(lastSessions)) {
-        if (samePath(savedProject, project) && requestedSession && samePath(savedSession, requestedSession)) delete lastSessions[savedProject];
-      }
-      await store.save({ lastSessions });
+function publicConnection(value: Connection): Connection {
+  return { ...value, state: publicRpcData('get_state', value.state), models: value.models.map(publicModel).filter((model): model is RpcRecord => Boolean(model)) };
+}
+async function rememberOpened(value: Connection): Promise<void> {
+  const sessionFile = typeof value.state.sessionFile === 'string' && await readSessionInfo(value.state.sessionFile, value.project) ? value.state.sessionFile as string : undefined;
+  let entry: ManagedConnection;
+  try { entry = connections.get(value.connectionId); } catch { return; }
+  if (connections.activeConnectionId === value.connectionId) {
+    await store.opened(value.project, sessionFile);
+    return;
+  }
+  // A slow startup may finish after the user selected a different chat. Record
+  // its project without moving the selected project or restore target backwards.
+  const prefs = store.get();
+  const project = { path: value.project, name: basename(value.project) || value.project, lastOpened: new Date().toISOString() };
+  const exists = prefs.projects.some(saved => samePath(saved.path, value.project));
+  await store.save({
+    projects: exists ? prefs.projects.map(saved => samePath(saved.path, value.project) ? project : saved) : [...prefs.projects, project],
+    ...(sessionFile && connections.isLatestSelection(entry) ? { lastSessions: { ...prefs.lastSessions, [value.project]: sessionFile } } : {}),
+  });
+}
+async function rememberSelected(id: string): Promise<void> {
+  let entry: ManagedConnection;
+  try { entry = connections.get(id); } catch { return; }
+  const { revision, selectionOrder, sessionPath } = entry;
+  // Selection needs only the cached chat ID. Validate its restore target from
+  // the small header, without scanning a large conversation's message records.
+  const header = sessionPath ? await readSessionHeader(sessionPath) : null;
+  if (entry.closing || connections.activeConnectionId !== entry.id || revision !== entry.revision || selectionOrder !== entry.selectionOrder || sessionPath !== entry.sessionPath) return;
+  await store.opened(entry.project, header && samePath(header.cwd, entry.project) ? sessionPath : undefined);
+}
+function connectionId(value: unknown): string | undefined {
+  return value === undefined ? undefined : text(value, '连接 ID', 200);
+}
+function createConnections(): ConnectionPool {
+  return new ConnectionPool({
+    onEvent: emit,
+    onState: rememberSession,
+    createClient: async (project, sessionPath, onEvent) => {
+      const diagnostics = await discoverDiagnostics(store.get(), { runtimeRoot, packaged: app.isPackaged, projectDir: project });
+      if (diagnostics.errors.length || !diagnostics.piPath || !diagnostics.nodePath) throw new Error(diagnostics.errors.join('\n'));
+      const launch = await createPiLaunchOptions(diagnostics, runtimeRoot, ['--mode', 'rpc', '--append-system-prompt', desktopProgressGuidance, ...(sessionPath ? ['--session', sessionPath] : [])], {
+        developmentLauncher: app.isPackaged ? undefined : join(app.getAppPath(), 'electron', 'pi-launcher.mjs'),
+      });
+      if (diagnostics.piVersion && diagnostics.piVersion !== expectedVersion) onEvent({ type: 'diagnostic', level: 'warning', message: `当前 Pi 为 ${diagnostics.piVersion}；本客户端已验证的版本为 ${expectedVersion}。` });
+      return new PiRpcClient({
+        executable: launch.executable,
+        args: launch.args,
+        cwd: project,
+        env: { ...launch.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+        requestTimeoutMs: 60_000,
+        onEvent,
+      });
+    },
+  });
+}
+async function connect(projectValue: unknown, sessionValue?: unknown, optionsValue?: unknown): Promise<Connection> {
+  if (optionsValue !== undefined && (!optionsValue || typeof optionsValue !== 'object' || Array.isArray(optionsValue) || ('newSession' in optionsValue && typeof (optionsValue as RpcRecord).newSession !== 'boolean'))) throw new Error('新会话选项无效。');
+  const options = optionsValue as { newSession?: boolean } | undefined;
+  const project = await projectPath(projectValue);
+  const requestedSession = options?.newSession || sessionValue === undefined ? undefined : resolve(text(sessionValue, '会话路径'));
+  const restored = await resolveSessionRestore(project, requestedSession);
+  const result = await connections.connect(project, restored.sessionPath ? await realpath(restored.sessionPath) : undefined, restored.missing ? { newSession: true } : options);
+  await rememberOpened(result);
+  if (restored.missing) {
+    const lastSessions = { ...store.get().lastSessions };
+    for (const [savedProject, savedSession] of Object.entries(lastSessions)) {
+      if (samePath(savedProject, project) && requestedSession && samePath(savedSession, requestedSession)) delete lastSessions[savedProject];
     }
-    emit({ type: 'connection_status', status: 'connected', project });
-    if (restored.missing) emit({ type: 'diagnostic', level: 'warning', message: '上次保存的会话文件已不存在，已为这个项目建立新会话。' });
-    if (diagnostics.piVersion && diagnostics.piVersion !== expectedVersion) emit({ type: 'diagnostic', level: 'warning', message: `当前 Pi 为 ${diagnostics.piVersion}；本客户端已验证的版本为 ${expectedVersion}。` });
-    return { project, state: publicRpcData('get_state', state), messages: messages.messages ?? [], models: (models.models ?? []).map(publicModel), commands: commandList.commands ?? [], stats };
-  } catch (error) {
-    if (candidate) await candidate.stop();
-    if (client === candidate) client = undefined;
-    emit({ type: 'connection_status', status: 'error', message: (error as Error).message });
-    throw error;
-  } finally { connecting = false; }
+    await store.save({ lastSessions });
+  }
+  if (restored.missing) emit({ type: 'diagnostic', connectionId: result.connectionId, project, level: 'warning', message: '上次保存的会话文件已不存在，已为这个项目建立新会话。' });
+  return publicConnection(result);
 }
 
 function validateCommand(value: unknown): RpcRecord {
@@ -220,41 +224,43 @@ function registerIpc(): void {
     return importProjects(value, store);
   });
   handle('pi:connect', connect);
-  handle('pi:disconnect', async () => { assertIdle(); sessionRevision++; const old = client; client = undefined; await old?.stop(); emit({ type: 'connection_status', status: 'disconnected' }); });
+  handle('pi:activateConnection', async value => {
+    const result = await connections.activate(text(value, '连接 ID', 200));
+    await rememberOpened(result);
+    return publicConnection(result);
+  });
+  handle('pi:selectConnection', value => {
+    const result = connections.select(text(value, '连接 ID', 200));
+    // Disk persistence runs after selection; it must not delay the next paint.
+    void rememberSelected(result.id).catch(error => emit({ type: 'diagnostic', connectionId: result.id, project: result.project, level: 'warning', message: `保存会话入口失败：${(error as Error).message}` }));
+    return result;
+  });
+  handle('pi:listConnections', () => connections.list());
+  handle('pi:disconnect', async value => connections.disconnect(connectionId(value)));
   handle('pi:listSessions', async value => listSessions(await projectPath(value)));
   handle('pi:savePreferences', async (patch: Partial<Preferences>) => {
     if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('设置格式无效。');
     return store.save(patch);
   });
-  handle('pi:rpc', async value => {
+  handle('pi:rpc', async (value, idValue) => {
     const command = validateCommand(value);
-    const active = requireClient();
-    const exclusive = sessionCommands.has(command.type) || ['set_model', 'cycle_model', 'set_thinking_level', 'cycle_thinking_level', 'compact', 'set_session_name'].includes(command.type);
-    if (!exclusive && (connecting || rpcMutation) && ['prompt', 'steer', 'follow_up', 'bash'].includes(command.type)) throw new Error('正在切换会话或模型，请等待完成后再发送。');
-    if (exclusive) {
-      assertIdle();
-      rpcMutation = true;
-      if (sessionCommands.has(command.type)) sessionRevision++;
+    const id = connectionId(idValue);
+    const active = connections.get(id);
+    if (command.type === 'switch_session') {
+      command.sessionPath = resolve(text(command.sessionPath, '会话路径'));
+      if (!(await readSessionInfo(command.sessionPath, active.project))) throw new Error('会话无效，或不属于当前项目。');
+      command.sessionPath = await realpath(command.sessionPath);
     }
-    const revision = sessionRevision;
-    try {
-      if (command.type === 'switch_session') {
-        command.sessionPath = resolve(text(command.sessionPath, '会话路径'));
-        if (!(await readSessionInfo(command.sessionPath, currentProject))) throw new Error('会话无效，或不属于当前项目。');
-      }
-      const data = await active.request(command, ['compact', 'bash', 'prompt', 'fork', 'clone', 'new_session', 'switch_session'].includes(command.type) ? 10 * 60_000 : 60_000);
-      if (sessionCommands.has(command.type) && !data.cancelled) await rememberSession(active, undefined, revision);
-      if (command.type === 'get_state' && !rpcMutation) await rememberSession(active, data, revision);
-      return publicRpcData(command.type, data);
-    } finally { if (exclusive) rpcMutation = false; }
+    const data = await connections.rpc(command, active.id);
+    return publicRpcData(command.type, data);
   });
-  handle('pi:respondUI', value => {
+  handle('pi:respondUI', (value, idValue) => {
     if (!value || typeof value.id !== 'string') throw new Error('扩展回复无效。');
     const response: RpcRecord = { type: 'extension_ui_response', id: value.id };
     if (typeof value.cancelled === 'boolean') response.cancelled = value.cancelled;
     if (typeof value.confirmed === 'boolean') response.confirmed = value.confirmed;
     if (typeof value.value === 'string') response.value = value.value.slice(0, 2 * 1024 * 1024);
-    requireClient().send(response);
+    connections.respondUI(response, connectionId(idValue));
   });
   handle('pi:chooseFiles', chooseFiles);
   handle('pi:openExternal', value => shell.openExternal(externalUrl(value)));
@@ -281,11 +287,11 @@ async function createWindow(): Promise<void> {
     if (closePending) return;
     closePending = true;
     void (async () => {
-      if (client?.busy || connecting) {
-        const result = await dialog.showMessageBox(window!, { type: 'question', title: '任务仍在运行', message: '停止任务并退出 Pi Desktop？', detail: 'Pi 会保留已经保存的会话。', buttons: ['继续运行', '停止并退出'], defaultId: 0, cancelId: 0, noLink: true });
+      if (connections.busyCount) {
+        const result = await dialog.showMessageBox(window!, { type: 'question', title: '任务仍在运行', message: '停止所有任务并退出 Pi Desktop？', detail: `还有 ${connections.busyCount} 个会话正在运行。Pi 会保留已经保存的会话。`, buttons: ['继续运行', '停止并退出'], defaultId: 0, cancelId: 0, noLink: true });
         if (result.response !== 1) { closePending = false; return; }
       }
-      await client?.stop();
+      await connections.stopAll();
       allowClose = true;
       window?.close();
     })().catch(() => { allowClose = true; window?.close(); });
@@ -302,9 +308,10 @@ else {
   app.whenReady().then(async () => {
     store = new PreferenceStore(join(app.getPath('userData'), 'preferences.json'));
     await store.load();
+    connections = createConnections();
     registerIpc();
     await createWindow();
   }).catch(error => { dialog.showErrorBox('Pi Desktop 启动失败', (error as Error).message); app.quit(); });
   app.on('window-all-closed', () => { app.quit(); });
-  app.on('before-quit', () => { if (client?.running && !window) void client.stop(); });
+  app.on('before-quit', () => { if (!window) void connections?.stopAll(); });
 }

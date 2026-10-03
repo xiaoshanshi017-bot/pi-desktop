@@ -1,0 +1,12 @@
+.message-history-nav { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 8px 0; margin: -6px 0 16px; border-bottom: 1px solid var(--border); background: var(--bg); }
+.message-history-range { margin-right: auto; font-size: 10px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.message-history-nav .text-button { color: var(--secondary); padding: 3px 0; font-size: 11px; white-space: nowrap; }
+.message-history-nav .text-button:hover:not(:disabled) { color: var(--purple); }
+.message-history-nav .text-button:disabled { opacity: .4; cursor: default; }
+.message-history-boundary { display: flex; align-items: center; justify-content: center; gap: 18px; margin: 0 0 22px; padding: 6px 0; }
+.message-history-boundary .text-button { font-size: 11px; }
+@media (max-width: 760px) {
+  .message-history-nav { gap: 8px; }
+  .message-history-range { font-size: 9px; }
+  .message-history-nav .text-button { font-size: 10px; }
+}

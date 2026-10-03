@@ -53,7 +53,7 @@ test('bundled launcher supplies an absolute Unicode default shell, preserves CLI
     const result = JSON.parse((await env.run()).stdout);
     assert.equal(result.first, env.shell);
     assert.equal(result.updated, './changed-shell.exe', 'later user settings retain precedence over the default');
-    assert.deepEqual(result.argv, [env.cli, '--mode', 'rpc', '--session', '中文 会话.jsonl']);
+    assert.deepEqual(result.argv, [env.cli, '--extension', resolve('electron', 'desktop-command-guard.mjs'), '--mode', 'rpc', '--session', '中文 会话.jsonl']);
     assert.equal(result.internalEnv, null, 'launcher-only environment does not propagate to tool commands');
     assert.equal(await readFile(env.settingsFile, 'utf8'), settingsBefore);
   } finally { await env.cleanup(); }

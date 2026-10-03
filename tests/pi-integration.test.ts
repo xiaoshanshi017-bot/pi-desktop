@@ -7,6 +7,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { PiRpcClient } from '../electron/rpc';
 import type { RpcRecord } from '../shared/types';
+import { desktopProgressGuidance } from '../shared/progress-guidance';
 
 // These tests use an isolated Pi configuration and never call a remote model.
 // PI_TEST_CLI can point to a different installation's dist/cli.js.
@@ -46,12 +47,12 @@ function isolatedEnvironment(agentDir: string): NodeJS.ProcessEnv {
   return { ...env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: '1', PI_SKIP_VERSION_CHECK: '1', NO_COLOR: '1' };
 }
 
-function createPi(cwd: string, agentDir: string, extraArgs: string[], onEvent?: (event: RpcRecord) => void) {
+function createPi(cwd: string, agentDir: string, extraArgs: string[], onEvent?: (event: RpcRecord) => void, launch: { cliPath?: string; launcher?: string; shell?: string } = {}) {
   const client = new PiRpcClient({
     executable: process.execPath,
-    args: [cli!, '--mode', 'rpc', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', ...extraArgs],
+    args: [...(launch.launcher ? [launch.launcher] : []), launch.cliPath ?? cli!, '--mode', 'rpc', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', ...extraArgs],
     cwd,
-    env: isolatedEnvironment(agentDir),
+    env: { ...isolatedEnvironment(agentDir), ...(launch.shell ? { PI_DESKTOP_BASH_PATH: launch.shell } : {}) },
     onEvent,
     // Match the desktop startup budget: cold Windows imports can be slower
     // while the pinned runtime is being installed or scanned by the runner.
@@ -138,7 +139,7 @@ test('real Pi streams through a local mock model, reads a Chinese filename, pers
   }));
   let settled!: () => void;
   const runFinished = new Promise<void>(resolve => { settled = resolve; });
-  const args = ['--provider', 'local-fixture', '--model', 'fixture-model', '--thinking', 'off'];
+  const args = ['--provider', 'local-fixture', '--model', 'fixture-model', '--thinking', 'off', '--append-system-prompt', desktopProgressGuidance];
   let client = createPi(directory.cwd, directory.agentDir, args, event => {
     events.push(event);
     if (event.type === 'agent_settled') settled();
@@ -158,6 +159,7 @@ test('real Pi streams through a local mock model, reads a Chinese filename, pers
     ]);
     assert.equal(requests.length, 2, 'one local completion requests a tool, a second reads its result');
     assert.equal(requests[0].model, 'fixture-model');
+    assert.ok(requests[0].messages.some((message: RpcRecord) => message.role === 'system' && message.content.includes(desktopProgressGuidance)), 'desktop progress guidance reaches the real model system prompt');
     assert.ok(requests[1].messages.some((message: RpcRecord) => message.role === 'tool' && String(message.content).includes(marker)));
     assert.ok(events.some(event => event.type === 'tool_execution_start' && event.toolName === 'read'));
     assert.ok(events.some(event => event.type === 'tool_execution_end' && !event.isError));
@@ -177,6 +179,86 @@ test('real Pi streams through a local mock model, reads a Chinese filename, pers
     assert.equal(resumedState.sessionName, '离线验证会话');
     assert.deepEqual((await client.request({ type: 'get_messages' })).messages, before.messages);
   } finally {
+    await client.stop();
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await removeIsolatedDirectory(directory.root);
+  }
+});
+
+const guardedCli = [
+  path.resolve('build/runtime/win32-x64/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js'),
+  path.resolve('release/win-unpacked/resources/runtime/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js'),
+].find(candidate => existsSync(candidate));
+const guardedShell = [
+  path.resolve('build/runtime/win32-x64/git/bin/bash.exe'),
+  'C:/Program Files/Git/bin/bash.exe',
+].find(candidate => existsSync(candidate));
+
+test('real desktop launcher injects the missing Bash limit and an explicit timeout kills a hung child and settles', { skip: !guardedCli || !guardedShell, timeout: 120_000 }, async () => {
+  const directory = await isolatedDirectory();
+  const requests: RpcRecord[] = [];
+  const events: RpcRecord[] = [];
+  const auditPath = path.join(directory.agentDir, 'tool-limits.jsonl');
+  const auditExtension = path.join(directory.agentDir, 'audit.js');
+  await writeFile(auditExtension, `import fs from 'node:fs';
+export default function(pi) {
+  pi.on('tool_call', event => {
+    if (event.toolName === 'bash') fs.appendFileSync(${JSON.stringify(auditPath)}, JSON.stringify({id: event.toolCallId, timeout: event.input.timeout}) + '\\n');
+  });
+}`);
+  const server = http.createServer(async (request, response) => {
+    if (request.method !== 'POST' || request.url !== '/v1/chat/completions') { response.writeHead(404).end(); return; }
+    let body = '';
+    for await (const chunk of request) body += chunk.toString();
+    requests.push(JSON.parse(body));
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    const first = requests.length === 1;
+    const delta = first ? { role: 'assistant', tool_calls: [
+      { index: 0, id: 'call_default_limit', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'node -e "console.log(\'DEFAULT_LIMIT_OK\')"' }) } },
+      { index: 1, id: 'call_explicit_limit', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'node -e "require(\'fs\').writeFileSync(\'timeout-child.pid\', String(process.pid)); console.log(\'HANG_STARTED\'); setInterval(() => {}, 1000)"', timeout: 2 }) } },
+    ] } : { role: 'assistant', content: 'TIMEOUT_RECOVERED' };
+    response.end(`data: ${JSON.stringify({ id: 'chatcmpl-guard', object: 'chat.completion.chunk', created: 1, model: 'fixture-model', choices: [{ index: 0, delta, finish_reason: first ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  await writeFile(path.join(directory.agentDir, 'models.json'), JSON.stringify({ providers: {
+    'local-fixture': { baseUrl: `http://127.0.0.1:${address.port}/v1`, api: 'openai-completions', apiKey: 'test-only-not-a-secret', models: [{ id: 'fixture-model', contextWindow: 32000, maxTokens: 1024 }] },
+  } }));
+  let resolveSettled!: () => void;
+  const settled = new Promise<void>(resolve => { resolveSettled = resolve; });
+  const client = createPi(directory.cwd, directory.agentDir,
+    ['--no-session', '--provider', 'local-fixture', '--model', 'fixture-model', '--thinking', 'off', '--extension', auditExtension],
+    event => { events.push(event); if (event.type === 'agent_settled') resolveSettled(); },
+    { cliPath: guardedCli, launcher: path.resolve('electron/pi-launcher.mjs'), shell: guardedShell });
+  let deadline: NodeJS.Timeout | undefined;
+  try {
+    await client.request({ type: 'get_state' });
+    await client.request({ type: 'prompt', message: 'Run the two fixture commands and report their results.' });
+    await Promise.race([settled, new Promise<never>((_, reject) => { deadline = setTimeout(() => reject(new Error('Guarded Pi did not settle after command timeout')), 20_000); })]);
+    assert.equal(requests.length, 2);
+    const limits = (await readFile(auditPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(limits.map(entry => entry.timeout), [300, 2]);
+    const prompt = requests[0].messages.filter((message: RpcRecord) => ['system', 'developer'].includes(message.role)).map((message: RpcRecord) => message.content).join('\n');
+    assert.match(prompt, /300 秒后终止/);
+    const completed = events.find(event => event.type === 'tool_execution_end' && event.toolCallId === 'call_default_limit');
+    assert.equal(completed?.isError, false);
+    const timedOut = events.find(event => event.type === 'tool_execution_end' && event.toolCallId === 'call_explicit_limit');
+    assert.equal(timedOut?.isError, true);
+    assert.match(JSON.stringify(timedOut?.result), /HANG_STARTED/);
+    assert.match(JSON.stringify(timedOut?.result), /timed out after 2 seconds/);
+    assert.ok(requests[1].messages.some((message: RpcRecord) => message.role === 'tool' && String(message.content).includes('timed out after 2 seconds')));
+    const childId = Number(await readFile(path.join(directory.cwd, 'timeout-child.pid'), 'utf8'));
+    for (let attempt = 0; attempt < 30; attempt++) {
+      let running = false;
+      try { process.kill(childId, 0); running = true; } catch { /* Child has ended. */ }
+      if (!running) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.throws(() => process.kill(childId, 0), 'the hung subprocess must actually end');
+    assert.equal((await client.request({ type: 'get_state' })).isStreaming, false);
+  } finally {
+    if (deadline) clearTimeout(deadline);
     await client.stop();
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     await removeIsolatedDirectory(directory.root);

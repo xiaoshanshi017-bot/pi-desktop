@@ -32,11 +32,11 @@ export function applyMessageEvent(messages: RpcRecord[], event: RpcRecord): RpcR
     if (typeof contentIndex !== 'number') return messages;
     const part = { ...(message.content[contentIndex] || {}) };
     if (delta.type === 'text_start') Object.assign(part, { type: 'text', text: '' });
-    if (delta.type === 'thinking_start') Object.assign(part, { type: 'thinking', thinking: '' });
+    if (delta.type === 'thinking_start') Object.assign(part, { type: 'thinking', thinking: '', _complete: false });
     if (delta.type === 'text_delta') Object.assign(part, { type: 'text', text: (part.text || '') + delta.delta });
     if (delta.type === 'thinking_delta') Object.assign(part, { type: 'thinking', thinking: (part.thinking || '') + delta.delta });
     if (delta.type === 'text_end' && typeof delta.content === 'string') Object.assign(part, { type: 'text', text: delta.content });
-    if (delta.type === 'thinking_end' && typeof delta.content === 'string') Object.assign(part, { type: 'thinking', thinking: delta.content });
+    if (delta.type === 'thinking_end') Object.assign(part, { _complete: true, ...(typeof delta.content === 'string' ? { type: 'thinking', thinking: delta.content } : {}) });
     if (delta.type === 'toolcall_start') Object.assign(part, { type: 'toolCall', _arguments: '' });
     if (delta.type === 'toolcall_delta') Object.assign(part, { type: 'toolCall', _arguments: (part._arguments || '') + delta.delta });
     if (delta.type === 'toolcall_end' && delta.toolCall) Object.assign(part, delta.toolCall);

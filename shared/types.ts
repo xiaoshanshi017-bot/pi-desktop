@@ -10,18 +10,22 @@ export interface Diagnostics { piPath: string | null; piVersion: string | null; 
 export interface ConfiguredModel { provider: string; id: string; name: string }
 export interface ModelConfigSummary { source: string; models: ConfiguredModel[]; defaultProvider?: string; defaultModel?: string; defaultThinkingLevel?: string; error?: string }
 export interface Bootstrap { preferences: Preferences; diagnostics: Diagnostics; version: string; modelConfig: ModelConfigSummary }
-export interface Connection { project: string; state: RpcRecord; messages: RpcRecord[]; models: RpcRecord[]; commands: RpcRecord[]; stats: RpcRecord }
+export interface Connection { connectionId?: string; project: string; state: RpcRecord; messages: RpcRecord[]; models: RpcRecord[]; commands: RpcRecord[]; stats: RpcRecord }
+export interface ConnectionSummary { id: string; project: string; sessionPath?: string; sessionName?: string; status: string; busy: boolean; lastActivity: number }
 export interface FileAttachment { name: string; path: string; type: 'text' | 'image'; content?: string; data?: string; mimeType?: string }
 export interface PiDesktopApi {
   bootstrap(): Promise<Bootstrap>;
   chooseProject(): Promise<string | null>;
   previewProjectMigration(): Promise<ProjectMigrationPreview>;
   importProjects(paths: string[]): Promise<ProjectMigrationResult>;
-  connect(project: string, sessionPath?: string): Promise<Connection>;
-  disconnect(): Promise<void>;
+  connect(project: string, sessionPath?: string, options?: { newSession?: boolean }): Promise<Connection>;
+  activateConnection(id: string): Promise<Connection>;
+  selectConnection(id: string): Promise<ConnectionSummary>;
+  listConnections(): Promise<ConnectionSummary[]>;
+  disconnect(connectionId?: string): Promise<void>;
   listSessions(project: string): Promise<SessionInfo[]>;
-  rpc(command: RpcRecord): Promise<RpcRecord>;
-  respondUI(response: RpcRecord): Promise<void>;
+  rpc(command: RpcRecord, connectionId?: string): Promise<RpcRecord>;
+  respondUI(response: RpcRecord, connectionId?: string): Promise<void>;
   onEvent(callback: (event: RpcRecord) => void): () => void;
   savePreferences(patch: Partial<Preferences>): Promise<Preferences>;
   chooseFiles(): Promise<FileAttachment[]>;
