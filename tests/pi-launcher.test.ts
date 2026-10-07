@@ -20,6 +20,10 @@ async function fixture() {
   await Promise.all([
     writeFile(join(packageRoot, 'package.json'), JSON.stringify({ type: 'module', version: '0.84.2' })),
     writeFile(settingsFile, '{}'), writeFile(shell, 'fixture'),
+    writeFile(join(packageRoot, 'dist', 'core', 'agent-session.js'), `export class AgentSession {
+  async abort() {} clearQueue() {} abortCompaction() {} abortBash() {}
+  async prompt() {} async _runAgentPrompt() {}
+}`),
     writeFile(settingsModule, `import {readFileSync} from 'node:fs';
 export class SettingsManager {
   constructor() { this.settings = JSON.parse(readFileSync(process.env.FIXTURE_SETTINGS, 'utf8')); }
@@ -50,7 +54,9 @@ test('bundled launcher supplies an absolute Unicode default shell, preserves CLI
   const env = await fixture();
   try {
     const settingsBefore = await readFile(env.settingsFile, 'utf8');
-    const result = JSON.parse((await env.run()).stdout);
+    const output = (await env.run()).stdout.trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(output[0], { type: 'desktop_capabilities', sessionControls: true });
+    const result = output[1];
     assert.equal(result.first, env.shell);
     assert.equal(result.updated, './changed-shell.exe', 'later user settings retain precedence over the default');
     assert.deepEqual(result.argv, [env.cli, '--extension', resolve('electron', 'desktop-command-guard.mjs'), '--mode', 'rpc', '--session', '中文 会话.jsonl']);
@@ -63,7 +69,7 @@ test('bundled launcher keeps Pi own configured shellPath unchanged', async () =>
   const env = await fixture();
   try {
     await writeFile(env.settingsFile, JSON.stringify({ shellPath: './用户 自定义/bash.exe' }));
-    const result = JSON.parse((await env.run()).stdout);
+    const result = JSON.parse((await env.run()).stdout.trim().split('\n').at(-1)!);
     assert.equal(result.first, './用户 自定义/bash.exe');
     assert.equal(JSON.parse(await readFile(env.settingsFile, 'utf8')).shellPath, './用户 自定义/bash.exe');
   } finally { await env.cleanup(); }

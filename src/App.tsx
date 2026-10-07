@@ -2,13 +2,15 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { ArrowDown, ArrowRight, ArrowUp, BookOpen, CheckCircle2, ChevronDown, ChevronRight, Code2, FileText, Folder, FolderOpen, GitBranch, Info, ListFilter, LoaderCircle, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, RefreshCw, Search, Settings, SlidersHorizontal, Sparkles, Square, Sun, Terminal, TriangleAlert, X, Zap } from 'lucide-react';
 import { ConversationMessages, type ConversationMessagesHandle } from './components/ConversationMessages';
 import { ProgressView } from './components/ProgressView';
+import { TaskRedirect } from './components/TaskRedirect';
 import { ActiveConversations } from './components/ActiveConversations';
 import { applyProgressEvent } from './progress';
 import { useWorkspace } from './useWorkspace';
 import { findOpenConversation, type Notice } from './workspace';
+import { createWorkspaceSnapshot, hydrateWorkspace } from './workspace-persistence';
 import { ModelControls } from './components/ModelControls';
 import { ProjectAttribution } from './components/ProjectAttribution';
-import type { Bootstrap, Connection, Diagnostics, FileAttachment, Preferences, ProjectMigrationPreview, RpcRecord, SessionInfo } from '../shared/types';
+import type { Bootstrap, CachedConversationTab, Connection, Diagnostics, FileAttachment, Preferences, ProjectMigrationPreview, RpcRecord, SessionInfo } from '../shared/types';
 import { applyMessageEvent, basename, compactNumber, errorText, textContent } from './conversation';
 
 const thinkingNames: Record<string, string> = { off: '关闭思考', minimal: '极简思考', low: '轻度思考', medium: '标准思考', high: '深度思考', xhigh: '更深思考', max: '最大思考' };
@@ -166,7 +168,7 @@ function ModelConfiguration({ summary, ready, runtimeCount, refreshing, refreshS
 export default function App() {
   const api = window.pi;
   const workspace = useWorkspace(api);
-  const { activeId, activeIdRef, views, viewsRef, eventRevisions, snapshotEpochs, connections, update, load, select } = workspace;
+  const { activeId, activeIdRef, views, viewsRef, eventRevisions, snapshotEpochs, connections, update, load, select, hydrate, forget } = workspace;
   const { status, project, state, messages, models, commands, stats, levels, busy, mutating, progress, draft, attachments, sendMode, queue, tools, notice, dialogs, widgets, statuses } = workspace.view;
   const messageWindowKey = conversationWindowKey(activeId, state);
   const { setStatus, setProject, setState, setMessages, setModels, setCommands, setStats, setLevels, setBusy, setMutating, setProgress, setDraft, setAttachments, setSendMode, setQueue, setTools, setNotice, setDialogs } = workspace.setters;
@@ -200,6 +202,8 @@ export default function App() {
   const scrollSize = useRef({ height: 0, content: 0 });
   const projectRef = useRef(project);
   const sendLocks = useRef(new Set<string>());
+  const sendVersions = useRef(new Map<string, number>());
+  const unsentRedirects = useRef(new Map<string, { draft: string; attachments: FileAttachment[] }>());
   const scrollPositions = useRef(new Map<string, { top: number; nearBottom: boolean }>());
   const reconnectSession = useRef<string | undefined>(undefined);
   const sessionGeneration = useRef(0);
@@ -209,9 +213,17 @@ export default function App() {
   const historyEpochs = useRef(new Map<string, number>());
   const connectionsRef = useRef(connections);
   connectionsRef.current = connections;
+  const restores = useRef(new Map<string, Promise<void>>());
+  const restoredTabs = useRef(new Map<string, CachedConversationTab>());
+  const persistenceReady = useRef(false);
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveWorkspaceRef = useRef<() => Promise<void>>(async () => {});
+  const uiRef = useRef({ sidebar, inspector });
+  uiRef.current = { sidebar, inspector };
   const settingsOpened = useRef(false);
   projectRef.current = project;
-  const ready = status === 'connected';
+  const ready = status === 'connected' && !workspace.view.restoring;
+  const redirectPending = workspace.view.redirect?.status === 'stopping' || workspace.view.redirect?.status === 'submitting';
   const locked = busy || mutating || navigating || status === 'connecting';
   const reportError = useCallback((error: unknown) => setNotice({ text: errorText(error), kind: 'error' }), [setNotice]);
   const inform = (text: string, kind: Notice['kind'] = 'info') => setNotice({ text, kind });
@@ -224,6 +236,37 @@ export default function App() {
     const items = await api.listSessions(path);
     if (historyEpochs.current.get(path) === epoch) historyCache.current.set(path, { sessions: items, updatedAt: Date.now() });
     return items;
+  }, [api]);
+
+  saveWorkspaceRef.current = async () => {
+    if (!api || !persistenceReady.current) return;
+    if (saveTimer.current !== null) { clearTimeout(saveTimer.current); saveTimer.current = null; }
+    const uiById: Record<string, CachedConversationTab['ui']> = {};
+    for (const view of Object.values(viewsRef.current)) {
+      const key = conversationWindowKey(view.id, view.state);
+      const scroll = view.id === activeIdRef.current && scrollRef.current
+        ? { top: scrollRef.current.scrollTop, nearBottom: nearBottom.current }
+        : scrollPositions.current.get(key);
+      uiById[view.id] = { windowStart: messageWindows.current.get(key) ?? null, scrollTop: scroll?.top || 0, nearBottom: scroll?.nearBottom ?? true };
+    }
+    await api.saveWorkspace(createWorkspaceSnapshot(viewsRef.current, connectionsRef.current, activeIdRef.current, uiById, Date.now(), uiRef.current));
+  };
+  const scheduleWorkspaceSave = useCallback(() => {
+    if (!persistenceReady.current || saveTimer.current !== null) return;
+    // Throttle full snapshots, so streaming tokens only mark a pending save.
+    saveTimer.current = setTimeout(() => {
+      saveTimer.current = null;
+      void saveWorkspaceRef.current().catch(error => {
+        const text = `工作区保存失败：${errorText(error)}`;
+        if (viewsRef.current[activeIdRef.current]?.notice?.text !== text) update(activeIdRef.current, { notice: { text, kind: 'error' } });
+      });
+    }, 1200);
+  }, [update, activeIdRef, viewsRef]);
+  useEffect(scheduleWorkspaceSave, [views, activeId, connections, sidebar, inspector, scheduleWorkspaceSave]);
+  useEffect(() => {
+    if (!api) return;
+    const unsubscribe = api.onWorkspaceFlush(() => saveWorkspaceRef.current());
+    return () => { unsubscribe(); if (saveTimer.current !== null) clearTimeout(saveTimer.current); };
   }, [api]);
 
   const loadConfiguredModels = useCallback((boot: Bootstrap) => {
@@ -325,6 +368,46 @@ export default function App() {
     reconnectSession.current = history.some(session => session.path === connection.state.sessionFile) ? connection.state.sessionFile : undefined;
   }, [api, load, update, readHistory]);
 
+  const restoreConversation = useCallback((id: string): Promise<void> => {
+    const pending = restores.current.get(id);
+    if (pending) return pending;
+    const cached = viewsRef.current[id];
+    if (!api || !cached) return Promise.resolve();
+    const tab = restoredTabs.current.get(id);
+    const sessionPath = tab?.sessionPath;
+    update(id, { status: 'restoring', restoring: true, notice: null });
+    const revision = eventRevisions.current.get(id) || 0;
+    const pendingRestore = (async () => {
+      try {
+        const connection = await api.connect(cached.project, sessionPath, { connectionId: id, background: true, restoring: true, newSession: !sessionPath });
+        if (!viewsRef.current[id]) { await api.disconnect(connection.connectionId); return; }
+        const oldKey = conversationWindowKey(id, viewsRef.current[id].state);
+        const newKey = conversationWindowKey(id, connection.state);
+        if (oldKey !== newKey) {
+          messageWindows.current.set(newKey, messageWindows.current.get(oldKey) ?? null);
+          const position = scrollPositions.current.get(oldKey);
+          if (position) scrollPositions.current.set(newKey, position);
+        }
+        load(connection, false, revision);
+        // Late background starts never move the selected tab.
+        if (activeIdRef.current === id) await api.selectConnection(id);
+        const supported = await api.rpc({ type: 'get_available_thinking_levels' }, id);
+        update(id, { levels: supported.levels || ['off'] });
+        if (activeIdRef.current === id) {
+          const request = ++historyGeneration.current;
+          const history = await readHistory(cached.project);
+          if (activeIdRef.current === id && request === historyGeneration.current) {
+            setSessions(history); reconnectSession.current = connection.state.sessionFile;
+          }
+        }
+      } catch (error) {
+        update(id, { status: 'error', restoring: false, busy: false, notice: { text: `未能恢复连接，已保留本地聊天：${errorText(error)}`, kind: 'error' } });
+      } finally { restores.current.delete(id); scheduleWorkspaceSave(); }
+    })();
+    restores.current.set(id, pendingRestore);
+    return pendingRestore;
+  }, [api, viewsRef, update, load, activeIdRef, eventRevisions, readHistory, scheduleWorkspaceSave]);
+
   const selectCachedConversation = useCallback(async (id: string) => {
     const cached = viewsRef.current[id];
     if (!api || !cached) return;
@@ -343,9 +426,12 @@ export default function App() {
     reconnectSession.current = cached.state.sessionFile;
     // Paint the hydrated view immediately. The lightweight native selection
     // never retrieves messages/models or waits for history and disk writes.
-    const selected = api.selectConnection(id).catch(error => {
+    const native = connectionsRef.current.some(connection => connection.id === id);
+    const selected = native ? api.selectConnection(id).catch(error => {
       if (generation === sessionGeneration.current) update(id, { notice: { text: errorText(error), kind: 'error' } });
-    });
+    }) : cached.restoring || cached.status === 'restoring' ? restoreConversation(id).then(async () => {
+      if (activeIdRef.current === id && viewsRef.current[id]?.status === 'connected') await api.selectConnection(id);
+    }) : Promise.resolve();
     if (!history || (previousProject !== cached.project && Date.now() - history.updatedAt > 15_000)) {
       void readHistory(cached.project).then(items => {
         if (generation === sessionGeneration.current && historyRequest === historyGeneration.current) setSessions(items);
@@ -354,12 +440,14 @@ export default function App() {
       });
     }
     await selected;
-  }, [api, activeIdRef, viewsRef, select, update, readHistory]);
+  }, [api, activeIdRef, viewsRef, select, update, readHistory, restoreConversation]);
 
   const connect = useCallback(async (path: string, sessionPath?: string, options?: { newSession?: boolean }) => {
     if (!api) return;
     if (!options?.newSession) {
-      const cachedId = findOpenConversation(viewsRef.current, connectionsRef.current, path, sessionPath, activeIdRef.current);
+      const samePath = (a: string, b: string) => a.replace(/\\/g, '/').toLocaleLowerCase() === b.replace(/\\/g, '/').toLocaleLowerCase();
+      const cachedId = findOpenConversation(viewsRef.current, connectionsRef.current, path, sessionPath, activeIdRef.current)
+        || Object.values(viewsRef.current).find(view => view.project && (view.restoring || view.state.sessionId || view.status === 'error') && samePath(view.project, path) && (!sessionPath || samePath(view.state.sessionFile || '', sessionPath)))?.id;
       if (cachedId) { await selectCachedConversation(cachedId); return; }
     }
     const generation = ++sessionGeneration.current;
@@ -369,7 +457,7 @@ export default function App() {
     try {
       await loadConnection(await api.connect(path, sessionPath, options), generation, revisions);
       if (generation !== sessionGeneration.current) return;
-      const boot = await api.bootstrap();
+      const boot = await api.bootstrap({ workspace: false });
       if (generation === sessionGeneration.current) { setBootstrap(boot); setPreferences(boot.preferences); }
     } catch (error) { if (generation === sessionGeneration.current) update(activeIdRef.current, { notice: { text: errorText(error), kind: 'error' } }); }
     finally { if (generation === sessionGeneration.current) setNavigating(false); }
@@ -378,7 +466,7 @@ export default function App() {
   const selectConversation = async (id: string) => {
     if (!api || id === activeIdRef.current) return;
     const cached = viewsRef.current[id];
-    if (cached?.status === 'connected' && cached.state.sessionId) { await selectCachedConversation(id); return; }
+    if (cached?.project && (cached.restoring || cached.state.sessionId || cached.status === 'error')) { await selectCachedConversation(id); return; }
     if (scrollRef.current) scrollPositions.current.set(conversationWindowKey(activeIdRef.current, viewsRef.current[activeIdRef.current]?.state || {}), { top: scrollRef.current.scrollTop, nearBottom: nearBottom.current });
     const generation = ++sessionGeneration.current;
     refreshGeneration.current++; historyGeneration.current++;
@@ -390,22 +478,20 @@ export default function App() {
   };
   const closeConversation = async (id: string) => {
     const item = connections.find(connection => connection.id === id);
-    if (!api || !item || navigating) return;
-    if (item.busy) { update(activeIdRef.current, { notice: { text: '这个会话仍在运行。切换到它并停止任务后，即可关闭；其他会话会继续工作。', kind: 'info' } }); return; }
+    if (!api || !viewsRef.current[id]?.project) return;
+    const view = viewsRef.current[id];
+    if (view.busy || view.mutating || (item?.busy && !view.restoring && view.status === 'connected')) { update(activeIdRef.current, { notice: { text: '这个会话仍在运行。切换到它并停止任务后，即可关闭；其他会话会继续工作。', kind: 'info' } }); return; }
+    const stillActive = activeIdRef.current === id;
+    forget(id); restoredTabs.current.delete(id);
+    scheduleWorkspaceSave();
+    if (stillActive) {
+      ++sessionGeneration.current;
+      const next = Object.values(viewsRef.current).find(view => view.project);
+      if (next) void selectCachedConversation(next.id);
+      else { setSessions([]); projectRef.current = ''; }
+    }
     try {
-      await api.disconnect(id);
-      const stillActive = activeIdRef.current === id;
-      workspace.forget(id);
-      if (stillActive) {
-        const generation = ++sessionGeneration.current;
-        const next = (await api.listConnections()).find(connection => connection.status === 'connected');
-        if (activeIdRef.current === 'welcome' && generation === sessionGeneration.current) {
-          if (next) {
-            const revisions = new Map(eventRevisions.current);
-            await loadConnection(await api.activateConnection(next.id), generation, revisions);
-          } else { setSessions([]); projectRef.current = ''; }
-        }
-      }
+      if (item || restores.current.has(id)) await api.disconnect(id);
     } catch (error) { update(activeIdRef.current, { notice: { text: errorText(error), kind: 'error' } }); }
   };
 
@@ -413,15 +499,45 @@ export default function App() {
     if (!api) return;
     let disposed = false;
     update('welcome', { status: 'initializing' });
-    void api.bootstrap().then(async boot => {
+    void api.bootstrap({ workspace: true }).then(async boot => {
       if (disposed) return;
       setBootstrap(boot); setPreferences(boot.preferences); setPiPath(boot.preferences.piPath || ''); setNodePath(boot.preferences.nodePath || '');
       loadConfiguredModels(boot);
       update('welcome', { status: 'disconnected' });
-      if (boot.preferences.lastProject) await connect(boot.preferences.lastProject, boot.preferences.lastSessions?.[boot.preferences.lastProject]);
+      if (boot.workspace) {
+        const restored = hydrateWorkspace(boot.workspace);
+        for (const tab of boot.workspace.tabs) restoredTabs.current.set(tab.id, tab);
+        for (const view of Object.values(restored.views)) {
+          view.restoring = true;
+          const ui = restored.uiById[view.id];
+          const key = conversationWindowKey(view.id, view.state);
+          if (ui) { messageWindows.current.set(key, ui.windowStart); scrollPositions.current.set(key, { top: ui.scrollTop, nearBottom: ui.nearBottom }); }
+        }
+        if (restored.ui?.sidebar !== undefined) setSidebar(restored.ui.sidebar);
+        if (restored.ui?.inspector !== undefined) setInspector(restored.ui.inspector);
+        hydrate(restored.views, restored.activeId);
+        const selected = restored.activeId ? restored.views[restored.activeId] : undefined;
+        projectRef.current = selected?.project || '';
+        reconnectSession.current = selected?.state.sessionFile;
+        persistenceReady.current = true;
+        const remaining = Object.keys(restored.views).filter(id => id !== 'welcome' && restored.views[id].project);
+        if (restored.activeId) remaining.sort((a, b) => Number(b === restored.activeId) - Number(a === restored.activeId));
+        // Restore the selected tab first, with at most two cold Pi starts at once.
+        const worker = async () => {
+          while (!disposed && remaining.length) {
+            const id = remaining.shift()!;
+            if (viewsRef.current[id]) await restoreConversation(id);
+          }
+        };
+        void Promise.all([worker(), worker()]);
+      } else {
+        persistenceReady.current = true;
+        if (boot.preferences.lastProject) await connect(boot.preferences.lastProject, boot.preferences.lastSessions?.[boot.preferences.lastProject]);
+      }
+      scheduleWorkspaceSave();
     }).catch(error => { if (!disposed) update(activeIdRef.current, { status: 'error', notice: { text: errorText(error), kind: 'error' } }); });
     return () => { disposed = true; };
-  }, [api, connect, update, activeIdRef, loadConfiguredModels]);
+  }, [api, connect, update, activeIdRef, viewsRef, loadConfiguredModels, hydrate, restoreConversation, scheduleWorkspaceSave]);
 
   useEffect(() => {
     if (!api) return;
@@ -487,34 +603,76 @@ export default function App() {
   };
   const chooseFiles = async () => { try { const files = await api.chooseFiles(); if (attachments.length + files.length > 10) throw new Error('每条消息最多添加 10 个附件，请先移除一些附件。'); setAttachments(previous => [...previous, ...files]); } catch (error) { reportError(error); } };
   const send = async () => {
-    if (!ready || mutating || navigating || sendLocks.current.has(activeId) || (!draft.trim() && !attachments.length)) return;
-    const prompt = draft.trim();
+    const id = activeIdRef.current;
+    const view = viewsRef.current[id];
+    if (!api || !view || view.status !== 'connected' || view.restoring || navigating) return;
+    const pending = view.redirect?.status === 'stopping' || view.redirect?.status === 'submitting';
+    const immediate = view.sendMode === 'redirect';
+    if ((view.mutating || sendLocks.current.has(id)) && !(pending && immediate)) return;
+    if (!view.draft.trim() && !view.attachments.length) return;
+    const prompt = view.draft.trim();
     const commandName = /^\/([^\s]+)/.exec(prompt)?.[1];
     if (commandName && !commands.some(command => command.name.replace(/^\//, '') === commandName)) {
       const supported: Record<string, () => void> = { new: newSession, fork: () => void beginFork(), compact: () => void compact(), model: () => document.getElementById('model-select')?.click(), settings: () => setSettings(true) };
       if (supported[commandName]) { if (locked && !['settings', 'new'].includes(commandName)) { inform('请先停止当前任务，再执行此命令。'); return; } setDraft(''); supported[commandName](); return; }
       reportError(`/${commandName} 未被当前 Pi 注册。终端专用命令请使用对应的界面入口，或在 Pi 终端中运行。`); return;
     }
-    const images = attachments.filter(file => file.type === 'image').map(file => ({ type: 'image', data: file.data, mimeType: file.mimeType }));
-    if (images.length && state.model?.input && !state.model.input.includes('image')) { reportError('当前模型不支持图片，请切换支持图片的模型。'); return; }
-    const textFiles = attachments.filter(file => file.type === 'text').map(file => `\n\n<attached_file path=${JSON.stringify(file.path)}>\n${file.content || ''}\n</attached_file>`).join('');
+    const images = view.attachments.filter(file => file.type === 'image').map(file => ({ type: 'image' as const, data: file.data || '', mimeType: file.mimeType || '' }));
+    if (images.length && view.state.model?.input && !view.state.model.input.includes('image')) { reportError('当前模型不支持图片，请切换支持图片的模型。'); return; }
+    const textFiles = view.attachments.filter(file => file.type === 'text').map(file => `\n\n<attached_file path=${JSON.stringify(file.path)}>\n${file.content || ''}\n</attached_file>`).join('');
     const message = (prompt || '请查看附件。') + textFiles;
-    const previousDraft = draft;
-    const previousAttachments = attachments;
-    sendLocks.current.add(activeId);
+    const previousDraft = view.draft;
+    const previousAttachments = view.attachments;
+    const version = (sendVersions.current.get(id) || 0) + 1;
+    sendVersions.current.set(id, version);
+    sendLocks.current.add(id);
+    const redirect = immediate && (view.busy || pending);
+    if (redirect) unsentRedirects.current.set(id, { draft: previousDraft, attachments: previousAttachments });
     refreshGeneration.current++;
     messageListRef.current?.showLatest();
-    setDraft(''); setAttachments([]); setShowCommands(false); nearBottom.current = true;
-    if (!busy) setProgress(previous => applyProgressEvent(previous, { type: 'prompt_submitted' }));
-    setMutating(true);
-    try { await rpc({ type: 'prompt', message, ...(images.length ? { images } : {}), ...(busy ? { streamingBehavior: sendMode } : {}) }); }
-    catch (error) { setDraft(previousDraft); setAttachments(previousAttachments); reportError(error); if (!viewsRef.current[activeId]?.busy) setProgress(previous => applyProgressEvent(previous, { type: 'prompt_error', message: errorText(error) })); }
-    finally { sendLocks.current.delete(activeId); setMutating(false); if (activeIdRef.current === activeId) composeRef.current?.focus(); }
+    update(id, previous => ({ ...previous, draft: '', attachments: [], mutating: true, notice: null, progress: view.busy || pending ? previous.progress : applyProgressEvent(previous.progress, { type: 'prompt_submitted' }) }));
+    setShowCommands(false); nearBottom.current = true;
+    const restoreEditor = () => update(id, previous => previous.draft || previous.attachments.length ? previous : { ...previous, draft: previousDraft, attachments: previousAttachments });
+    try {
+      if (redirect) {
+        const result = await api.redirect({ message, ...(images.length ? { images } : {}) }, id);
+        if (sendVersions.current.get(id) !== version) return;
+        if (result.status === 'cancelled') {
+          restoreEditor();
+          update(id, { notice: { text: '已停止，新的要求没有发送。', kind: 'info' } });
+        } else if (result.status === 'submitted') unsentRedirects.current.delete(id);
+      } else {
+        await api.rpc({ type: 'prompt', message, ...(images.length ? { images } : {}), ...(view.busy ? { streamingBehavior: view.sendMode === 'afterTool' ? 'steer' : 'followUp' } : {}) }, id);
+      }
+    } catch (error) {
+      if (sendVersions.current.get(id) !== version) return;
+      restoreEditor();
+      update(id, previous => ({ ...previous, notice: { text: errorText(error), kind: 'error' }, progress: previous.busy ? previous.progress : applyProgressEvent(previous.progress, { type: 'prompt_error', message: errorText(error) }) }));
+    } finally {
+      if (sendVersions.current.get(id) === version) {
+        sendLocks.current.delete(id); update(id, { mutating: false });
+        if (activeIdRef.current === id) composeRef.current?.focus();
+      }
+    }
   };
-  const stop = async () => { try { setProgress(previous => applyProgressEvent(previous, { type: 'stop_requested' })); await rpc({ type: 'abort' }); } catch (error) { reportError(error); setProgress(previous => applyProgressEvent(previous, { type: 'stop_failed' })); } };
+  const stop = async () => {
+    const id = activeIdRef.current;
+    update(id, previous => ({ ...previous, progress: applyProgressEvent(previous.progress, { type: 'stop_requested' }) }));
+    try { await api.rpc({ type: 'abort' }, id); }
+    catch (error) { update(id, previous => ({ ...previous, notice: { text: errorText(error), kind: 'error' }, progress: applyProgressEvent(previous.progress, { type: 'stop_failed' }) })); }
+  };
+  const recoverRedirect = () => {
+    const saved = unsentRedirects.current.get(activeId);
+    if (!saved) return;
+    if (draft || attachments.length) { inform('输入框已有新草稿，请先保留或发送它，再恢复这条要求。'); return; }
+    setDraft(saved.draft); setAttachments(saved.attachments); composeRef.current?.focus();
+  };
   const compact = async () => { if (locked) return; setMutating(true); setProgress(previous => applyProgressEvent(previous?.endedAt === undefined ? previous : null, { type: 'compaction_start' })); try { await rpc({ type: 'compact' }); const nextState = await refresh(true); const stillBusy = Boolean(nextState?.isStreaming || nextState?.isCompacting); setBusy(stillBusy); if (!stillBusy) setProgress(previous => applyProgressEvent(previous, { type: 'manual_compaction_end' })); inform('上下文已压缩。', 'success'); } catch (error) { reportError(error); setBusy(false); setProgress(previous => applyProgressEvent(previous, { type: 'prompt_error', message: errorText(error) })); } finally { setMutating(false); } };
   const reconnectConversation = async () => {
     if (!api || locked || !project || activeId === 'welcome') return;
+    if (restoredTabs.current.has(activeId) && !connectionsRef.current.some(item => item.id === activeId)) {
+      await restoreConversation(activeId); return;
+    }
     const sessionPath = reconnectSession.current;
     setNavigating(true);
     try { await api.disconnect(activeId); workspace.forget(activeId); await connect(project, sessionPath, sessionPath ? undefined : { newSession: true }); }
@@ -523,14 +681,14 @@ export default function App() {
   const saveSettings = async () => {
     try {
       const saved = await api.savePreferences({ piPath: piPath.trim(), nodePath: nodePath.trim() });
-      setPreferences(saved); const boot = await api.bootstrap(); setBootstrap(boot); inform('设置已保存。路径修改会在下次连接项目时生效。', 'success');
+      setPreferences(saved); const boot = await api.bootstrap({ workspace: false }); setBootstrap(boot); inform('设置已保存。路径修改会在下次连接项目时生效。', 'success');
     } catch (error) { reportError(error); }
   };
   const refreshModelConfiguration = async () => {
     if (!api || refreshingModels) return;
     setRefreshingModels(true); setModelRefreshStatus('');
     try {
-      const boot = await api.bootstrap();
+      const boot = await api.bootstrap({ workspace: false });
       setBootstrap(boot); loadConfiguredModels(boot);
       setModelRefreshStatus(boot.modelConfig?.error ? '读取配置时发现问题，请查看上方提示。' : projectRef.current ? '配置已重新读取。当前会话保持运行，任务结束后重新连接 Pi 即可加载变更。' : '配置已重新读取，打开项目后即可选择模型。');
     } catch (error) { setModelRefreshStatus(errorText(error)); }
@@ -555,11 +713,11 @@ export default function App() {
   const currentModelKey = state.model ? `${state.model.provider}/${state.model.id}` : '';
   const modelOptions = state.model && !models.some(model => `${model.provider}/${model.id}` === currentModelKey) ? [state.model, ...models] : models;
   const onDrop = (event: DragEvent) => { event.preventDefault(); setDragging(false); void addBrowserFiles([...event.dataTransfer.files]); };
-  const openConversations = connections.map(connection => {
-    const view = views[connection.id];
-    return { ...connection, sessionName: view?.state.sessionName || textContent(view?.messages.find(message => message.role === 'user')).split('\n')[0]?.slice(0, 28) || connection.sessionName || '新会话', status: view?.dialogs.length ? 'attention' : connection.status, unread: Boolean(view?.unread) };
+  const openConversations = Object.values(views).filter(view => view.project).map(view => {
+    const connection = connections.find(item => item.id === view.id);
+    return { id: view.id, project: view.project, busy: view.busy || (!view.restoring && view.status === 'connected' && Boolean(connection?.busy)), lastActivity: connection?.lastActivity || restoredTabs.current.get(view.id)?.lastActivity || 0, sessionName: view.state.sessionName || textContent(view.messages.find(message => message.role === 'user')).split('\n')[0]?.slice(0, 28) || connection?.sessionName || '新会话', status: view.dialogs.length ? 'attention' : view.status, unread: Boolean(view.unread) };
   });
-  const runningCount = connections.filter(connection => connection.busy).length;
+  const runningCount = openConversations.filter(connection => connection.busy).length;
 
   useEffect(() => {
     if (settings && !settingsOpened.current) { setPiPath(preferences.piPath || ''); setNodePath(preferences.nodePath || ''); }
@@ -576,17 +734,17 @@ export default function App() {
 
   return <div data-connection-id={activeId} className={`app-shell ${sidebar ? '' : 'sidebar-hidden'} ${inspector ? '' : 'inspector-hidden'}`}>
     {sidebar && <aside className="sidebar"><div className="brand"><PiMark small /><span className="brand-name"><span>Pi <span className="brand-light">Desktop</span></span><small className="brand-subtitle">Pi 非官方客户端</small></span><span className="preview-tag">BETA</span><IconButton label="收起侧栏" onClick={() => setSidebar(false)}><PanelLeftClose size={17} /></IconButton></div><button className="new-chat" disabled={navigating || !api} onClick={newSession}><Plus size={17} />新建会话<span>Ctrl N</span></button><div className="sidebar-section-heading"><span>工作空间</span><IconButton label="打开项目文件夹" disabled={navigating || !api} onClick={() => void openProject()}><Plus size={15} /></IconButton></div><button className={`project-item ${project ? 'active' : ''}`} disabled={navigating || !api} onClick={() => void openProject()}><span className="project-symbol"><FolderOpen size={17} /></span><span><strong>{project ? basename(project) : '打开项目'}</strong><small>{project ? '当前工作目录' : '选择一个本地文件夹'}</small></span><ChevronDown size={14} /></button>{preferences.projects.filter(item => item.path !== project).slice(0, 3).map(item => <button key={item.path} className="recent-project" disabled={navigating} onClick={() => void connect(item.path, preferences.lastSessions?.[item.path])}><Folder size={15} /><span>{item.name}</span></button>)}<div className="project-sidebar-actions"><button className="project-library-button" onClick={() => setProjectLibrary('library')}><BookOpen size={14} /><span>全部项目</span><span className="count-label">{preferences.projects.length}</span><ChevronRight size={13} /></button><button className="project-migration-button" disabled={!api} onClick={() => setProjectLibrary('migration')}><ArrowDown size={14} /><span>导入 Pi Web 项目</span></button></div>{openConversations.some(item => item.busy || item.unread || item.status === 'attention') && <section className="running-session-list" aria-label="后台任务"><div className="sidebar-section-heading"><span>任务</span><span className="count-label">{runningCount} 个运行中</span></div>{openConversations.filter(item => item.busy || item.unread || item.status === 'attention').map(item => <button className={`running-session-item ${item.id === activeId ? 'selected' : ''}`} key={item.id} disabled={navigating} onClick={() => void selectConversation(item.id)} title={`${basename(item.project)} · ${item.sessionName}`}><span>{item.busy ? <LoaderCircle size={13} className="spin" /> : <CheckCircle2 size={13} />}</span><span><strong>{item.sessionName}</strong><small>{basename(item.project)}</small></span><span className="session-status-text">{item.status === 'attention' ? '待确认' : item.busy ? '运行中' : '已完成'}</span></button>)}</section>}<div className="sidebar-section-heading history-heading"><span>最近会话</span><span className="history-heading-actions"><span className="count-label">{sessions.length || '—'}</span><IconButton className="icon-button history-refresh-button" label="刷新历史会话" disabled={!project || refreshingHistory || mutating || status === 'connecting'} onClick={() => void refreshHistory()}><RefreshCw size={13} className={refreshingHistory ? 'spin' : ''} /></IconButton></span></div><label className="search-box"><Search size={14} /><input aria-label="搜索会话" placeholder="搜索会话…" value={search} onChange={event => setSearch(event.target.value)} />{search ? <IconButton className="icon-button history-search-clear" label="清空会话搜索" onClick={() => setSearch('')}><X size={13} /></IconButton> : <kbd>⌕</kbd>}</label><nav className="session-list" aria-label="历史会话">{filteredSessions.map(session => <button key={session.path} className={`session-item ${session.path === state.sessionFile ? 'selected' : ''}`} disabled={navigating} onClick={() => void connect(project, session.path)}><MessageSquare size={15} /><span><strong>{session.name || session.firstMessage?.slice(0, 45) || '未命名会话'}</strong><small>{new Date(session.modified).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })} · {session.messageCount} 条消息</small></span></button>)}{!filteredSessions.length && <div className="no-sessions"><MessageSquare size={21} /><p>{search ? '没有找到相关会话' : '每一个想法，都有迹可循'}</p><span>{search ? '试试其他关键词' : '开始对话后，会话会保存在这里'}</span></div>}</nav><div className="sidebar-bottom"><div className="local-note"><span className={`status-dot ${ready ? 'online' : ''}`} /><span>{ready ? 'Pi 已连接 · 本地会话' : status === 'connecting' ? '正在连接 Pi…' : '在你的电脑上工作'}</span></div><button className="settings-button" onClick={() => setSettings(true)}><Settings size={17} /><span>设置与连接</span><kbd>Ctrl ,</kbd></button></div></aside>}
-    <div className="workspace"><header className="topbar"><div className="breadcrumb">{!sidebar && <IconButton label="展开侧栏" onClick={() => setSidebar(true)}><PanelLeftOpen size={18} /></IconButton>}<span className="project-breadcrumb"><Folder size={15} />{project ? basename(project) : '工作空间'}</span><span className="breadcrumb-slash">/</span><span className="current-title" title={title}>{title}</span>{ready && <IconButton label="重命名会话" disabled={locked} onClick={() => { setSessionName(state.sessionName || title); setRename(true); }}><Pencil size={13} /></IconButton>}</div><div className="topbar-actions">{navigating && <span className="navigation-status"><LoaderCircle size={13} className="spin" />打开会话中</span>}<IconButton label="新建并行会话" disabled={navigating || !api} onClick={newSession}><Plus size={17} /></IconButton><span className={`connection-pill ${ready ? 'connected' : ''}`}><span className={`status-dot ${ready ? 'online' : ''}`} />{ready ? '已连接' : status === 'connecting' || status === 'initializing' ? '连接中' : '未连接'}</span><IconButton label={inspector ? '收起会话详情' : '展开会话详情'} onClick={() => setInspector(value => !value)}>{inspector ? <PanelRightClose size={18} /> : <PanelRightOpen size={18} />}</IconButton></div></header>
+    <div className="workspace"><header className="topbar"><div className="breadcrumb">{!sidebar && <IconButton label="展开侧栏" onClick={() => setSidebar(true)}><PanelLeftOpen size={18} /></IconButton>}<span className="project-breadcrumb"><Folder size={15} />{project ? basename(project) : '工作空间'}</span><span className="breadcrumb-slash">/</span><span className="current-title" title={title}>{title}</span>{ready && <IconButton label="重命名会话" disabled={locked} onClick={() => { setSessionName(state.sessionName || title); setRename(true); }}><Pencil size={13} /></IconButton>}</div><div className="topbar-actions">{navigating && <span className="navigation-status"><LoaderCircle size={13} className="spin" />打开会话中</span>}<IconButton label="新建并行会话" disabled={navigating || !api} onClick={newSession}><Plus size={17} /></IconButton><span className={`connection-pill ${ready ? 'connected' : ''}`}><span className={`status-dot ${ready ? 'online' : ''}`} />{ready ? '已连接' : status === 'restoring' ? '恢复连接中' : status === 'connecting' || status === 'initializing' ? '连接中' : '未连接'}</span><IconButton label={inspector ? '收起会话详情' : '展开会话详情'} onClick={() => setInspector(value => !value)}>{inspector ? <PanelRightClose size={18} /> : <PanelRightOpen size={18} />}</IconButton></div></header>
       <ActiveConversations items={openConversations} activeId={activeId} onSelect={id => void selectConversation(id)} onClose={id => void closeConversation(id)} />
       <main className="chat-main"><div className="chat-toolbar"><ModelControls models={modelOptions} modelKey={currentModelKey} model={state.model} levels={levels} thinkingLevel={state.thinkingLevel || 'off'} disabled={!ready || locked} ready={ready} project={project} onModelChange={key => void switchModel(key)} onThinkingChange={level => void changeThinking(level)} /><div className="toolbar-spacer" />{ready && <button className="context-summary" title="查看上下文使用与会话详情" onClick={() => setInspector(value => !value)}><span>上下文</span><strong>{contextPercent == null ? "—" : `${Math.round(contextPercent)}%`}</strong></button>}{messages.length > 0 && <button className="text-button fork-button" disabled={locked} onClick={() => void beginFork()}><GitBranch size={14} />创建分支</button>}</div>
-        {notice && <div className={`notice ${notice.kind}`} role={notice.kind === 'error' ? 'alert' : 'status'}>{notice.kind === 'error' ? <TriangleAlert size={16} /> : notice.kind === 'success' ? <CheckCircle2 size={16} /> : <Info size={16} />}<span>{notice.text}</span>{status === 'error' && project && <button disabled={locked} onClick={() => void connect(project, reconnectSession.current)}>重试</button>}<IconButton label="关闭提示" onClick={() => setNotice(null)}><X size={14} /></IconButton></div>}
-        <div className="conversation-scroll" key={messageWindowKey} role="tabpanel" aria-label="当前会话" ref={scrollRef} onScroll={() => { const element = scrollRef.current; if (element) { if (element.clientHeight === scrollSize.current.height && element.scrollHeight === scrollSize.current.content) nearBottom.current = messageListRef.current?.isLatest() !== false && element.scrollHeight - element.scrollTop - element.clientHeight < 110; setShowScroll(!nearBottom.current); scrollPositions.current.set(messageWindowKey, { top: element.scrollTop, nearBottom: nearBottom.current }); } }}>
-          {!visibleMessages.length ? <div className="empty-state"><div className="welcome-label"><span />你的本地 AI 编程伙伴</div><div className="hero-mark"><PiMark /><span className="hero-orbit orbit-one" /><span className="hero-orbit orbit-two" /><span className="hero-dot" /></div><h1>从一个想法开始。</h1><p>读懂代码，解决问题，让想法落地。<br />Pi 和你一起，在自己的工作空间里完成。</p>{!ready ? <button className="button primary open-project-hero" disabled={navigating || !api} onClick={() => void openProject()}>{status === 'connecting' ? <LoaderCircle size={16} className="spin" /> : <FolderOpen size={17} />}{status === 'connecting' ? '正在连接项目…' : '打开项目文件夹'}<ArrowRight size={16} /></button> : <div className="project-ready"><span className="status-dot online" />已准备好在 <strong>{basename(project)}</strong> 中工作</div>}{!ready && bootstrap?.diagnostics && !bootstrap.diagnostics.errors.length && bootstrap.diagnostics.piPath && bootstrap.diagnostics.nodePath && bootstrap.diagnostics.bashPath && <div className="runtime-ready-note" data-runtime-mode={[bootstrap.diagnostics.piSource, bootstrap.diagnostics.nodeSource, bootstrap.diagnostics.bashSource].every(source => source === 'bundled') ? 'bundled' : 'local'}><CheckCircle2 size={13} /><span>{[bootstrap.diagnostics.piSource, bootstrap.diagnostics.nodeSource, bootstrap.diagnostics.bashSource].every(source => source === 'bundled') ? '内置运行环境已就绪，无需单独安装' : '本地运行环境已就绪'}</span><button className="text-button" onClick={() => setSettings(true)}>查看环境</button></div>}{!ready && bootstrap?.modelConfig && !bootstrap.modelConfig.error && !bootstrap.modelConfig.models.length && <div className="model-setup-welcome"><span>使用模型需要 API 密钥或服务商登录。</span><button className="text-button" onClick={() => setSettings(true)}>模型设置<ArrowRight size={12} /></button></div>}{Boolean(bootstrap?.modelConfig?.models.length) && !bootstrap?.modelConfig?.error && <div className="model-config-welcome"><span><CheckCircle2 size={14} />已接入 {bootstrap?.modelConfig?.models.length} 项模型配置<button className="text-button" onClick={() => setSettings(true)}>查看模型<ArrowRight size={12} /></button></span>{!ready && <small>打开项目后，即可选择并使用已有模型。</small>}</div>}{bootstrap?.modelConfig?.error && <button className="text-button model-config-welcome-error" onClick={() => setSettings(true)}><TriangleAlert size={14} />模型配置读取异常，查看设置</button>}{!ready && preferences.projects.length > 0 && <button className="text-button project-library-welcome project-library-button" onClick={() => setProjectLibrary('library')}><BookOpen size={14} />从 {preferences.projects.length} 个已有项目中选择<ArrowRight size={13} /></button>}<div className="starter-grid">{starters.map(({ icon: Icon, title: starterTitle, description, prompt }) => <button key={starterTitle} className="starter-card" onClick={() => { setDraft(prompt); composeRef.current?.focus(); }}><Icon size={19} /><strong>{starterTitle}</strong><span>{description}</span><ArrowRight size={14} className="starter-arrow" /></button>)}</div></div> : <ConversationMessages ref={messageListRef} windowKey={messageWindowKey} messages={visibleMessages} modelName={state.model?.name || 'Assistant'} resultMap={resultMap} tools={tools} onError={reportError} onCopy={copyMessage} scrollRef={scrollRef} nearBottomRef={nearBottom} windowsRef={messageWindows}>{busy && !progress && <div className="activity-line"><span className="pulse-dots"><i /><i /><i /></span>{activity || 'Pi 正在处理任务'}</div>}</ConversationMessages>}
+        {notice && <div className={`notice ${notice.kind}`} role={notice.kind === 'error' ? 'alert' : 'status'}>{notice.kind === 'error' ? <TriangleAlert size={16} /> : notice.kind === 'success' ? <CheckCircle2 size={16} /> : <Info size={16} />}<span>{notice.text}</span>{status === 'error' && project && <button disabled={locked} onClick={() => void (restoredTabs.current.has(activeId) ? restoreConversation(activeId) : connect(project, reconnectSession.current))}>重试</button>}<IconButton label="关闭提示" onClick={() => setNotice(null)}><X size={14} /></IconButton></div>}
+        <div className="conversation-scroll" key={messageWindowKey} role="tabpanel" aria-label="当前会话" ref={scrollRef} onScroll={() => { const element = scrollRef.current; if (element) { if (element.clientHeight === scrollSize.current.height && element.scrollHeight === scrollSize.current.content) nearBottom.current = messageListRef.current?.isLatest() !== false && element.scrollHeight - element.scrollTop - element.clientHeight < 110; setShowScroll(!nearBottom.current); scrollPositions.current.set(messageWindowKey, { top: element.scrollTop, nearBottom: nearBottom.current }); scheduleWorkspaceSave(); } }}>
+          {!visibleMessages.length ? <div className="empty-state"><div className="welcome-label"><span />你的本地 AI 编程伙伴</div><div className="hero-mark"><PiMark /><span className="hero-orbit orbit-one" /><span className="hero-orbit orbit-two" /><span className="hero-dot" /></div><h1>从一个想法开始。</h1><p>读懂代码，解决问题，让想法落地。<br />Pi 和你一起，在自己的工作空间里完成。</p>{!ready ? <button className="button primary open-project-hero" disabled={navigating || !api} onClick={() => void openProject()}>{status === 'connecting' ? <LoaderCircle size={16} className="spin" /> : <FolderOpen size={17} />}{status === 'connecting' ? '正在连接项目…' : '打开项目文件夹'}<ArrowRight size={16} /></button> : <div className="project-ready"><span className="status-dot online" />已准备好在 <strong>{basename(project)}</strong> 中工作</div>}{!ready && bootstrap?.diagnostics && !bootstrap.diagnostics.errors.length && bootstrap.diagnostics.piPath && bootstrap.diagnostics.nodePath && bootstrap.diagnostics.bashPath && <div className="runtime-ready-note" data-runtime-mode={[bootstrap.diagnostics.piSource, bootstrap.diagnostics.nodeSource, bootstrap.diagnostics.bashSource].every(source => source === 'bundled') ? 'bundled' : 'local'}><CheckCircle2 size={13} /><span>{[bootstrap.diagnostics.piSource, bootstrap.diagnostics.nodeSource, bootstrap.diagnostics.bashSource].every(source => source === 'bundled') ? '内置运行环境已就绪，无需单独安装' : '本地运行环境已就绪'}</span><button className="text-button" onClick={() => setSettings(true)}>查看环境</button></div>}{!ready && bootstrap?.modelConfig && !bootstrap.modelConfig.error && !bootstrap.modelConfig.models.length && <div className="model-setup-welcome"><span>使用模型需要 API 密钥或服务商登录。</span><button className="text-button" onClick={() => setSettings(true)}>模型设置<ArrowRight size={12} /></button></div>}{Boolean(bootstrap?.modelConfig?.models.length) && !bootstrap?.modelConfig?.error && <div className="model-config-welcome"><span><CheckCircle2 size={14} />已接入 {bootstrap?.modelConfig?.models.length} 项模型配置<button className="text-button" onClick={() => setSettings(true)}>查看模型<ArrowRight size={12} /></button></span>{!ready && <small>打开项目后，即可选择并使用已有模型。</small>}</div>}{bootstrap?.modelConfig?.error && <button className="text-button model-config-welcome-error" onClick={() => setSettings(true)}><TriangleAlert size={14} />模型配置读取异常，查看设置</button>}{!ready && preferences.projects.length > 0 && <button className="text-button project-library-welcome project-library-button" onClick={() => setProjectLibrary('library')}><BookOpen size={14} />从 {preferences.projects.length} 个已有项目中选择<ArrowRight size={13} /></button>}<div className="starter-grid">{starters.map(({ icon: Icon, title: starterTitle, description, prompt }) => <button key={starterTitle} className="starter-card" onClick={() => { setDraft(prompt); composeRef.current?.focus(); }}><Icon size={19} /><strong>{starterTitle}</strong><span>{description}</span><ArrowRight size={14} className="starter-arrow" /></button>)}</div></div> : <ConversationMessages ref={messageListRef} windowKey={messageWindowKey} messages={visibleMessages} modelName={state.model?.name || 'Assistant'} resultMap={resultMap} tools={tools} onError={reportError} onCopy={copyMessage} scrollRef={scrollRef} nearBottomRef={nearBottom} windowsRef={messageWindows} onWindowChange={scheduleWorkspaceSave}>{busy && !progress && <div className="activity-line"><span className="pulse-dots"><i /><i /><i /></span>{activity || 'Pi 正在处理任务'}</div>}</ConversationMessages>}
         </div>
         {showScroll && <button className="jump-bottom" onClick={() => { messageListRef.current?.showLatest(); nearBottom.current = true; scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' }); }}><ArrowDown size={15} />回到最新</button>}
-        <div className="composer-area">{progress && <ProgressView key={`${activeId}-${progress.startedAt}`} progress={progress} onStop={() => void stop()} />}{Object.entries(widgets).filter(([, lines]) => lines.length).map(([key, lines]) => <div className="extension-widget" key={key}>{lines.join('\n')}</div>)}{(queue.steering.length > 0 || queue.followUp.length > 0) && <div className="queue-list">{queue.steering.map((text, index) => <div key={`s${index}`}><Zap size={13} /><span>调整当前任务</span><p>{text}</p></div>)}{queue.followUp.map((text, index) => <div key={`f${index}`}><ListFilter size={13} /><span>完成后继续</span><p>{text}</p></div>)}</div>}
+        <div className="composer-area"><TaskRedirect request={workspace.view.redirect} onStop={() => void stop()} onRecover={recoverRedirect} canRecover={unsentRedirects.current.has(activeId) && !draft && !attachments.length} />{(status === 'restoring' || workspace.view.restoring) && <div className="workspace-restore-note" role="status"><LoaderCircle size={13} className="spin" />上次打开的会话已恢复，正在后台连接 Pi…</div>}{progress && <ProgressView key={`${activeId}-${progress.startedAt}`} progress={progress} onStop={() => void stop()} />}{Object.entries(widgets).filter(([, lines]) => lines.length).map(([key, lines]) => <div className="extension-widget" key={key}>{lines.join('\n')}</div>)}{(queue.steering.length > 0 || queue.followUp.length > 0) && <div className="queue-list"><div className="queue-delivery-hint">这些消息尚未生效；选择“立即调整”发送新要求，可中止当前执行并替换等待消息。</div>{queue.steering.map((text, index) => <div key={`s${index}`}><Zap size={13} /><span>工具结束后调整</span><p>{text}</p></div>)}{queue.followUp.map((text, index) => <div key={`f${index}`}><ListFilter size={13} /><span>完成后继续</span><p>{text}</p></div>)}</div>}
           {(showCommands || (draft.startsWith('/') && !draft.includes(' '))) && ready && <div className="command-menu"><div className="command-menu-heading"><span>可用命令</span><IconButton label="关闭命令" onClick={() => setShowCommands(false)}><X size={13} /></IconButton></div>{commandMatches.length ? commandMatches.map(command => <button key={command.name} onClick={() => { setDraft(`/${command.name.replace(/^\//, '')} `); setShowCommands(false); composeRef.current?.focus(); }}><Terminal size={15} /><span><strong>/{command.name.replace(/^\//, '')}</strong><small>{command.description || command.source}</small></span><span className="command-source">{command.source}</span></button>) : <p>暂无匹配的扩展、技能或提示模板。<br />使用界面入口管理模型、会话与设置。</p>}</div>}
-          <div className={`composer ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true); }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }} onDrop={onDrop}>{attachments.length > 0 && <div className="attachments">{attachments.map((attachment, index) => <div className="attachment" key={`${attachment.name}-${index}`}>{attachment.type === 'image' ? <img src={`data:${attachment.mimeType};base64,${attachment.data}`} alt="" /> : <FileText size={16} />}<span>{attachment.name}</span><button aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments(previous => previous.filter((_, i) => i !== index))}><X size={12} /></button></div>)}</div>}<textarea ref={composeRef} disabled={mutating || navigating} aria-label="输入消息" rows={2} value={draft} placeholder={ready ? '你想一起完成什么？输入 / 查看命令' : '先打开一个项目，让 Pi 了解你的工作空间…'} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) { event.preventDefault(); void send(); } }} onPaste={event => { const files = [...event.clipboardData.files]; if (files.length) { event.preventDefault(); void addBrowserFiles(files); } }} /><div className="composer-bottom"><div className="composer-tools"><IconButton label="添加图片或文本文件" disabled={!api || mutating} onClick={() => void chooseFiles()}><Paperclip size={17} /></IconButton><button className="command-trigger" title="命令面板 Ctrl K" disabled={!ready} onClick={() => setShowCommands(value => !value)}><span>/</span><span>命令</span></button><span className="attachment-hint">支持拖入文件、粘贴图片</span></div><div className="send-controls">{busy && <button className="parallel-new-chat text-button" disabled={navigating} onClick={newSession} title="当前任务继续运行，在新会话中开始另一项任务"><Plus size={13} />新会话并行</button>}{busy && <select className="queue-mode" aria-label="消息发送方式" value={sendMode} onChange={event => setSendMode(event.target.value)}><option value="steer">调整当前任务</option><option value="followUp">完成后继续</option></select>}{busy && <button className="stop-button" onClick={() => void stop()} title="停止任务"><Square size={13} fill="currentColor" /></button>}<button className="send-button" aria-label={busy ? '追加消息' : '发送消息'} title={busy ? '追加消息' : '发送消息 Enter'} disabled={!ready || mutating || navigating || (!draft.trim() && !attachments.length)} onClick={() => void send()}>{mutating ? <LoaderCircle size={17} className="spin" /> : <ArrowUp size={19} />}</button></div></div>{dragging && <div className="drop-overlay"><Paperclip size={24} />松开以添加文件</div>}</div><div className="composer-caption"><span>{busy ? '可调整当前任务，或新开会话并行推进' : '在当前项目中读取文件、编辑代码与执行命令'}</span><span><kbd>Enter</kbd> 发送 <span className="caption-dot">·</span> <kbd>Shift Enter</kbd> 换行</span></div></div>
+          <div className={`composer ${dragging ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); setDragging(true); }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }} onDrop={onDrop}>{attachments.length > 0 && <div className="attachments">{attachments.map((attachment, index) => <div className="attachment" key={`${attachment.name}-${index}`}>{attachment.type === 'image' ? <img src={`data:${attachment.mimeType};base64,${attachment.data}`} alt="" /> : <FileText size={16} />}<span>{attachment.name}</span><button aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments(previous => previous.filter((_, i) => i !== index))}><X size={12} /></button></div>)}</div>}<textarea ref={composeRef} disabled={navigating} aria-label="输入消息" rows={2} value={draft} placeholder={ready ? '你想一起完成什么？输入 / 查看命令' : project ? '聊天已恢复，连接就绪后即可发送；可先编辑草稿…' : '先打开一个项目，让 Pi 了解你的工作空间…'} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) { event.preventDefault(); void send(); } }} onPaste={event => { const files = [...event.clipboardData.files]; if (files.length) { event.preventDefault(); void addBrowserFiles(files); } }} /><div className="composer-bottom"><div className="composer-tools"><IconButton label="添加图片或文本文件" disabled={!api || mutating} onClick={() => void chooseFiles()}><Paperclip size={17} /></IconButton><button className="command-trigger" title="命令面板 Ctrl K" disabled={!ready} onClick={() => setShowCommands(value => !value)}><span>/</span><span>命令</span></button><span className="attachment-hint">支持拖入文件、粘贴图片</span></div><div className="send-controls">{busy && <button className="parallel-new-chat text-button" disabled={navigating} onClick={newSession} title="当前任务继续运行，在新会话中开始另一项任务"><Plus size={13} />新会话并行</button>}{(busy || redirectPending) && <select className="queue-mode" aria-label="消息发送方式" value={sendMode} onChange={event => setSendMode(event.target.value)}><option value="redirect">立即调整</option><option value="afterTool">工具结束后调整</option><option value="followUp">完成后继续</option></select>}{(busy || redirectPending) && <button className="stop-button" aria-label="停止任务" onClick={() => void stop()} title="停止当前任务并取消等待消息"><Square size={13} fill="currentColor" /></button>}<button className="send-button" aria-label={busy || redirectPending ? sendMode === 'redirect' ? '立即调整任务' : '追加消息' : '发送消息'} title={busy || redirectPending ? sendMode === 'redirect' ? '停止当前执行，按新要求继续' : sendMode === 'afterTool' ? '当前工具结束后发送' : '本轮任务完成后发送' : '发送消息 Enter'} disabled={!ready || (mutating && !(redirectPending && sendMode === 'redirect')) || navigating || (!draft.trim() && !attachments.length)} onClick={() => void send()}>{mutating ? <LoaderCircle size={17} className="spin" /> : <ArrowUp size={19} />}</button></div></div>{dragging && <div className="drop-overlay"><Paperclip size={24} />松开以添加文件</div>}</div><div className="composer-caption"><span>{busy || redirectPending ? sendMode === 'redirect' ? '立即调整会停止当前执行；已完成的修改保留，等待消息将取消' : sendMode === 'afterTool' ? '等待当前工具结束，再按补充要求调整下一步' : '本轮完成后，再处理这条消息' : '在当前项目中读取文件、编辑代码与执行命令'}</span><span><kbd>Enter</kbd> 发送 <span className="caption-dot">·</span> <kbd>Shift Enter</kbd> 换行</span></div></div>
       </main><footer className="statusbar"><span className="status-directory" title={project}><Folder size={12} />{project || '尚未选择项目'}</span><div>{Object.values(statuses).filter(Boolean).map((text, index) => <span key={index}>{text}</span>)}{runningCount > 0 && <span><LoaderCircle size={11} className="spin" />{runningCount} 个会话运行中</span>}<span>本地保存</span><span className="version-label">Pi {bootstrap?.diagnostics.piVersion || 'Desktop'}</span></div></footer></div>
     {inspector && <aside className="inspector"><div className="inspector-header"><SlidersHorizontal size={15} /><strong>会话详情</strong></div><div className="inspector-content"><div className="inspector-heading">工作空间</div><div className="workspace-card"><span className="folder-tile"><FolderOpen size={21} /></span><strong>{project ? basename(project) : '等待连接项目'}</strong><p title={project}>{project || '选择文件夹后，Pi 会在这里工作'}</p>{project && <button className="text-button" onClick={() => void api.revealFile(project).catch(reportError)}>在资源管理器打开<ArrowRight size={12} /></button>}</div><div className="inspector-heading context-heading"><span>上下文</span><span>{contextPercent == null ? '—' : `${Math.round(contextPercent)}%`}</span></div><div className="context-track"><div style={{ width: `${Math.min(contextPercent || 0, 100)}%` }} /></div><div className="context-caption"><span>{stats.contextUsage?.tokens == null ? '等待首条回复' : `${compactNumber(stats.contextUsage.tokens)} 已使用`}</span><span>{stats.contextUsage?.contextWindow ? `${compactNumber(stats.contextUsage.contextWindow)} 上限` : '—'}</span></div><button className="compact-button" disabled={!ready || locked || !messages.length} onClick={() => void compact()}><ListFilter size={14} />压缩上下文</button><div className="inspector-heading usage-heading">本次会话</div><div className="stat-row"><span>消息</span><strong>{stats.totalMessages ?? messages.length}</strong></div><div className="stat-row"><span>工具调用</span><strong>{stats.toolCalls ?? 0}</strong></div><div className="stat-row"><span>输入 Token</span><strong>{compactNumber(stats.tokens?.input || 0)}</strong></div><div className="stat-row"><span>输出 Token</span><strong>{compactNumber(stats.tokens?.output || 0)}</strong></div><div className="stat-row"><span>缓存读取</span><strong>{compactNumber(stats.tokens?.cacheRead || 0)}</strong></div><div className="stat-row cost-row"><span>估算费用 <Info size={11} /></span><strong>${Number(stats.cost || 0).toFixed(4)}</strong></div><p className="cost-note">根据模型定价与用量估算，实际费用以服务商账单为准。</p><div className="inspector-heading quick-heading">会话操作</div><button className="inspector-action" disabled={!ready || locked || !messages.length} onClick={() => void beginFork()}><GitBranch size={15} />从历史消息创建分支<ChevronRight size={13} /></button><button className="inspector-action" disabled={!ready || locked} onClick={() => { setSessionName(state.sessionName || title); setRename(true); }}><Pencil size={14} />重命名会话<ChevronRight size={13} /></button><button className="inspector-action" disabled={locked || !project} onClick={() => void reconnectConversation()}><RefreshCw size={14} />重新连接 Pi<ChevronRight size={13} /></button></div><div className="inspector-tip"><BookOpen size={17} /><strong>给想法一点上下文</strong><p>把文件拖到输入框，或说出目标。Pi 会先了解项目，再与你一起推进。</p><span>你的工作空间，你的节奏。</span></div></aside>}
     {projectLibrary && <ProjectLibrary mode={projectLibrary} preferences={preferences} currentProject={project} locked={navigating} onModeChange={setProjectLibrary} onClose={closeProjectLibrary} onOpen={path => { if (!navigating) { setProjectLibrary(null); void connect(path, preferences.lastSessions?.[path]); } }} onChooseFolder={() => { setProjectLibrary(null); void openProject(); }} onImported={setPreferences} />}

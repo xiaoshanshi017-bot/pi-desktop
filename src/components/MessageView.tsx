@@ -7,6 +7,7 @@ import type { RpcRecord } from '../../shared/types';
 import { textContent } from '../conversation';
 import { formatDuration, outputPreview, toolLabel, toolSummary } from '../progress';
 import { useClock } from '../useClock';
+import { isCancelledMessage } from '../cancellation';
 
 type ErrorHandler = (error: unknown) => void;
 const remarkPlugins = [remarkGfm];
@@ -82,6 +83,7 @@ interface MessageViewProps {
 }
 
 export const MessageView = memo(function MessageView({ message, modelName, resultMap, tools, onError, onCopy }: MessageViewProps) {
+  const cancelled = isCancelledMessage(message);
   const copyText = useMemo(() => message.role === 'assistant' && !message._streaming ? textContent(message) : '', [message]);
   const bashCall = useMemo(() => ({ name: 'bash', arguments: { command: message.command } }), [message.command]);
   const bashResult = useMemo(() => ({ content: [{ type: 'text', text: message.output }], isError: message.exitCode !== 0 }), [message.output, message.exitCode]);
@@ -99,8 +101,8 @@ export const MessageView = memo(function MessageView({ message, modelName, resul
         })}
         {message.role === 'bashExecution' && <ToolCard call={bashCall} result={bashResult} onError={onError} />}
         {message.role === 'compactionSummary' && <LazyDetails summary={<><ListFilter size={14} />上下文摘要<ChevronRight size={12} /></>}>{() => <div><Markdown text={message.summary || ''} onError={onError} /></div>}</LazyDetails>}
-        {message.errorMessage && <p className="message-error"><TriangleAlert size={15} />{message.errorMessage}</p>}
-        {message.stopReason === 'aborted' && <p className="muted small-text">本次回复已停止</p>}
+        {message.errorMessage && !cancelled && <p className="message-error"><TriangleAlert size={15} />{message.errorMessage}</p>}
+        {cancelled && <p className="muted small-text">本次回复已停止</p>}
       </div>
       {copyText && <div className="message-actions"><button onClick={() => onCopy(copyText)}><Copy size={13} />复制</button></div>}
     </div>

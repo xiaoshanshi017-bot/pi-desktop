@@ -43,6 +43,7 @@ interface Pending {
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
+export interface IdleWaitOptions { signal?: AbortSignal; timeoutMs?: number }
 
 export class PiRpcClient {
   private child?: ChildProcessWithoutNullStreams;
@@ -54,11 +55,35 @@ export class PiRpcClient {
   private closing?: Promise<void>;
   private stderr = '';
   private alive = false;
+  private sessionControls = false;
+  private idleWaiters = new Set<{ finish(error?: Error): void }>();
   constructor(private readonly options: PiRpcOptions) {}
   get running(): boolean { return this.alive && !this.stopped; }
+  get hasSessionControls(): boolean { return this.sessionControls; }
   get busy(): boolean {
     return this.unsettled || this.streaming || this.compacting || [...this.pending.values()].some(p =>
       ['prompt', 'compact', 'bash', 'fork', 'clone', 'new_session', 'switch_session'].includes(p.command));
+  }
+  waitForIdle({ signal, timeoutMs = 60_000 }: IdleWaitOptions = {}): Promise<void> {
+    if (signal?.aborted) return Promise.reject(new Error('任务调整已取消。'));
+    if (!this.running) return Promise.reject(new Error('Pi 已断开连接。'));
+    if (!this.busy) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = () => waiter.finish(new Error('任务调整已取消。'));
+      const timer = setTimeout(() => waiter.finish(new Error('停止旧任务等待超时；新要求尚未发送。')), timeoutMs);
+      const waiter = { finish: (error?: Error) => {
+        if (!this.idleWaiters.delete(waiter)) return;
+        clearTimeout(timer); signal?.removeEventListener('abort', onAbort);
+        if (error) reject(error); else resolve();
+      } };
+      this.idleWaiters.add(waiter);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.checkIdle();
+    });
+  }
+  private checkIdle(): void {
+    if (this.running && this.busy) return;
+    for (const waiter of [...this.idleWaiters]) waiter.finish(this.running ? undefined : new Error('Pi 已断开连接。'));
   }
   start(): void {
     if (this.child) throw new Error('Pi 进程已经启动。');
@@ -103,10 +128,11 @@ export class PiRpcClient {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Pi 指令 ${command.type} 等待超时。任务可能仍在执行，请检查状态或停止任务。`));
+        this.checkIdle();
       }, timeoutMs);
       this.pending.set(id, { command: command.type, resolve, reject, timer });
       try { this.send({ ...command, id }); } catch (error) {
-        clearTimeout(timer); this.pending.delete(id); reject(error);
+        clearTimeout(timer); this.pending.delete(id); reject(error); this.checkIdle();
       }
     });
   }
@@ -137,19 +163,23 @@ export class PiRpcClient {
         }
         pending.resolve(event.data ?? {});
       }
+      this.checkIdle();
       return;
     }
     if (event.type === 'agent_start') { this.streaming = true; this.unsettled = true; }
+    if (event.type === 'desktop_capabilities') this.sessionControls = event.sessionControls === true;
     if (event.type === 'agent_end') this.streaming = false;
     if (event.type === 'agent_settled') { this.streaming = false; this.unsettled = false; }
     if (event.type === 'compaction_start' || event.type === 'auto_compaction_start') this.compacting = true;
     if (event.type === 'compaction_end' || event.type === 'auto_compaction_end') this.compacting = false;
     this.emit(event);
+    this.checkIdle();
   }
   private emit(event: RpcRecord): void { this.options.onEvent?.(event); }
   private fail(error: Error): void {
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); }
     this.pending.clear();
+    for (const waiter of [...this.idleWaiters]) waiter.finish(error);
   }
   stop(): Promise<void> {
     if (this.closing) return this.closing;
@@ -158,6 +188,7 @@ export class PiRpcClient {
   }
   private async shutdown(): Promise<void> {
     this.stopped = true;
+    this.checkIdle();
     const child = this.child;
     if (!child || !this.alive) { this.fail(new Error('Pi 已断开连接。')); return; }
     // Closing stdin lets Pi abort tools, dispose extensions, and save the session.

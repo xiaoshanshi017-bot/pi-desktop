@@ -9,25 +9,41 @@ export type RuntimeSource = 'bundled' | 'system' | 'custom';
 export interface Diagnostics { piPath: string | null; piVersion: string | null; nodePath: string | null; nodeVersion: string | null; bashPath: string | null; agentDir: string; errors: string[]; piSource?: RuntimeSource; nodeSource?: RuntimeSource; bashSource?: RuntimeSource; runtimeRoot?: string; warnings?: string[] }
 export interface ConfiguredModel { provider: string; id: string; name: string }
 export interface ModelConfigSummary { source: string; models: ConfiguredModel[]; defaultProvider?: string; defaultModel?: string; defaultThinkingLevel?: string; error?: string }
-export interface Bootstrap { preferences: Preferences; diagnostics: Diagnostics; version: string; modelConfig: ModelConfigSummary }
+export interface CachedConversationTab {
+  id: string; project: string; sessionPath?: string; lastActivity: number; unread: boolean;
+  view: RpcRecord;
+  ui: { windowStart: number | null; scrollTop: number; nearBottom: boolean };
+}
+export interface WorkspaceSnapshot {
+  version: 1; savedAt: number; activeId: string | null; tabs: CachedConversationTab[];
+  ui?: { sidebar?: boolean; inspector?: boolean };
+}
+export interface Bootstrap { preferences: Preferences; diagnostics: Diagnostics; version: string; modelConfig: ModelConfigSummary; workspace?: WorkspaceSnapshot | null }
+export interface ConnectOptions { newSession?: boolean; connectionId?: string; background?: boolean; restoring?: boolean }
+export interface BootstrapOptions { workspace?: boolean }
 export interface Connection { connectionId?: string; project: string; state: RpcRecord; messages: RpcRecord[]; models: RpcRecord[]; commands: RpcRecord[]; stats: RpcRecord }
 export interface ConnectionSummary { id: string; project: string; sessionPath?: string; sessionName?: string; status: string; busy: boolean; lastActivity: number }
 export interface FileAttachment { name: string; path: string; type: 'text' | 'image'; content?: string; data?: string; mimeType?: string }
+export interface RedirectPrompt { message: string; images?: Array<{ type: 'image'; data: string; mimeType: string }> }
+export interface RedirectResult { requestId: string; status: 'submitted' | 'superseded' | 'cancelled'; cancelled?: boolean; superseded?: boolean }
 export interface PiDesktopApi {
-  bootstrap(): Promise<Bootstrap>;
+  bootstrap(options?: BootstrapOptions): Promise<Bootstrap>;
   chooseProject(): Promise<string | null>;
   previewProjectMigration(): Promise<ProjectMigrationPreview>;
   importProjects(paths: string[]): Promise<ProjectMigrationResult>;
-  connect(project: string, sessionPath?: string, options?: { newSession?: boolean }): Promise<Connection>;
+  connect(project: string, sessionPath?: string, options?: ConnectOptions): Promise<Connection>;
   activateConnection(id: string): Promise<Connection>;
   selectConnection(id: string): Promise<ConnectionSummary>;
   listConnections(): Promise<ConnectionSummary[]>;
   disconnect(connectionId?: string): Promise<void>;
   listSessions(project: string): Promise<SessionInfo[]>;
   rpc(command: RpcRecord, connectionId?: string): Promise<RpcRecord>;
+  redirect(prompt: RedirectPrompt, connectionId?: string): Promise<RedirectResult>;
   respondUI(response: RpcRecord, connectionId?: string): Promise<void>;
   onEvent(callback: (event: RpcRecord) => void): () => void;
   savePreferences(patch: Partial<Preferences>): Promise<Preferences>;
+  saveWorkspace(snapshot: WorkspaceSnapshot): Promise<void>;
+  onWorkspaceFlush(callback: () => void | Promise<void>): () => void;
   chooseFiles(): Promise<FileAttachment[]>;
   openExternal(url: string): Promise<void>;
   revealFile(path: string): Promise<void>;

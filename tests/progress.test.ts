@@ -4,7 +4,7 @@ import { applyProgressEvent, applyToolEvent, interruptTools, outputPreview, type
 import type { RpcRecord } from '../shared/types';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { ToolCard } from '../src/components/MessageView';
+import { MessageView, ToolCard } from '../src/components/MessageView';
 
 function run() {
   let progress: RunProgress | null = null;
@@ -62,6 +62,73 @@ test('stop and disconnect leave unfinished tools unconfirmed, never completed or
     assert.equal(stopped.steps.find(step => step.id === 'pending')?.status, 'interrupted');
     assert.equal(apply({ type: 'agent_settled' }, 2200), stopped, 'late events cannot turn an interruption into success');
   }
+});
+
+test('redirect progress waits for real settlement before a fresh run and also handles an idle redirect', () => {
+  for (const idle of [false, true]) {
+    const apply = run();
+    if (!idle) {
+      apply({ type: 'agent_start' }, 100);
+      apply({ type: 'tool_execution_start', toolCallId: 'long-tool', toolName: 'bash', args: { command: 'long command' } }, 101);
+    }
+    const redirect = apply({ type: 'redirect_update', requestId: 'redirect-A', status: 'stopping' }, 110);
+    assert.equal(redirect.label, '正在调整任务');
+    assert.equal(redirect.phase, 'stopping');
+    assert.match(redirect.detail, /停止当前执行后/);
+    if (!idle) {
+      assert.equal(apply({ type: 'agent_end' }, 120).endedAt, undefined, 'agent_end is not settlement');
+      const ended = apply({ type: 'agent_settled' }, 130);
+      assert.equal(ended.phase, 'interrupted');
+    }
+    const submitting = apply({ type: 'redirect_update', requestId: 'redirect-A', status: 'submitting' }, 140);
+    assert.notEqual(submitting.endedAt, undefined);
+    const fresh = apply({ type: 'agent_start' }, 150);
+    assert.equal(fresh.startedAt, 150);
+    assert.equal(fresh.phase, 'thinking');
+    assert.equal(fresh.stopRequested, undefined);
+    assert.equal(fresh.redirectRequestId, undefined);
+    assert.equal(apply({ type: 'redirect_update', requestId: 'redirect-A', status: 'submitted' }, 151), fresh, 'handoff completion cannot finish the fresh run');
+  }
+});
+
+test('failed redirects resume observed running progress instead of pretending the command stopped', () => {
+  const apply = run();
+  apply({ type: 'agent_start' }, 100);
+  apply({ type: 'tool_execution_start', toolCallId: 'long-tool', toolName: 'bash', args: { command: 'still running' } }, 101);
+  apply({ type: 'redirect_update', requestId: 'redirect-A', status: 'stopping' }, 102);
+  const failed = apply({ type: 'redirect_update', requestId: 'redirect-A', status: 'error', error: 'stop timed out' }, 103);
+  assert.equal(failed.phase, 'tool');
+  assert.equal(failed.detail, 'still running');
+  assert.equal(failed.stopRequested, false);
+  assert.equal(failed.endedAt, undefined);
+});
+
+test('cancelling a redirect keeps the old run stopping until it settles and ends an idle handoff immediately', () => {
+  const apply = run();
+  apply({ type: 'agent_start' }, 100);
+  apply({ type: 'redirect_update', requestId: 'redirect-A', status: 'stopping' }, 101);
+  const cancelled = apply({ type: 'redirect_update', requestId: 'redirect-A', status: 'cancelled' }, 102);
+  assert.equal(cancelled.phase, 'stopping');
+  assert.equal(cancelled.endedAt, undefined);
+  assert.equal(apply({ type: 'agent_settled' }, 103).phase, 'interrupted');
+  apply({ type: 'redirect_update', requestId: 'idle-B', status: 'stopping' }, 110);
+  assert.equal(apply({ type: 'redirect_update', requestId: 'idle-B', status: 'cancelled' }, 111).endedAt, 111);
+});
+
+test('user cancellation is shown neutrally while provider errors keep their error display', () => {
+  const onError = () => {};
+  const onCopy = () => {};
+  const base = { message: { role: 'assistant', timestamp: 1, content: [], stopReason: 'aborted', errorMessage: 'The request was aborted' }, modelName: 'offline', resultMap: {}, tools: {}, onError, onCopy };
+  const aborted = renderToStaticMarkup(createElement(MessageView, base));
+  assert.match(aborted, /本次回复已停止/);
+  assert.doesNotMatch(aborted, /message-error|The request was aborted/);
+  const error = renderToStaticMarkup(createElement(MessageView, { ...base, message: { ...base.message, stopReason: 'error', errorMessage: 'provider unavailable' } }));
+  assert.match(error, /message-error/);
+  assert.match(error, /provider unavailable/);
+  const sdkAbort = renderToStaticMarkup(createElement(MessageView, { ...base, message: { ...base.message, content: [{ type: 'text', text: 'partial response remains visible' }], stopReason: 'error', errorMessage: 'This operation was aborted' } }));
+  assert.match(sdkAbort, /partial response remains visible/);
+  assert.match(sdkAbort, /本次回复已停止/);
+  assert.doesNotMatch(sdkAbort, /message-error|This operation was aborted/);
 });
 
 test('tool updates use cumulative snapshots, preserve timestamps and replace partial output with authoritative results', () => {

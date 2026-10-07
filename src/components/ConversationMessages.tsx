@@ -21,11 +21,12 @@ interface ConversationMessagesProps {
   scrollRef: RefObject<HTMLDivElement | null>;
   nearBottomRef: RefObject<boolean>;
   windowsRef: RefObject<Map<string, number | null>>;
+  onWindowChange?: () => void;
   children?: ReactNode;
 }
 
 /** Bounded pages avoid parsing the entire saved conversation on every switch. */
-export const ConversationMessages = memo(forwardRef<ConversationMessagesHandle, ConversationMessagesProps>(function ConversationMessages({ windowKey, messages, modelName, resultMap, tools, onError, onCopy, scrollRef, nearBottomRef, windowsRef, children }, ref) {
+export const ConversationMessages = memo(forwardRef<ConversationMessagesHandle, ConversationMessagesProps>(function ConversationMessages({ windowKey, messages, modelName, resultMap, tools, onError, onCopy, scrollRef, nearBottomRef, windowsRef, onWindowChange, children }, ref) {
   const [stored, setStored] = useState(() => ({ key: windowKey, start: windowsRef.current.get(windowKey) ?? null }));
   const start = stored.key === windowKey ? stored.start : windowsRef.current.get(windowKey) ?? null;
   const page = messageWindow(messages.length, start);
@@ -42,6 +43,7 @@ export const ConversationMessages = memo(forwardRef<ConversationMessagesHandle, 
       moveTo.current = null;
     }
     setStored({ key: windowKey, start: next });
+    onWindowChange?.();
   }
 
   useImperativeHandle(ref, () => ({

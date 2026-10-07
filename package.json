@@ -1,6 +1,6 @@
 {
   "name": "pi-desktop",
-  "version": "0.2.3",
+  "version": "0.2.5",
   "private": true,
   "description": "Unofficial Windows desktop GUI client for Pi Coding Agent",
   "homepage": "https://github.com/xiaoshanshi017-bot/pi-desktop#readme",
@@ -73,7 +73,10 @@
         "from": "build/runtime/win32-x64",
         "to": "runtime",
         "filter": [
-          "**/*"
+          "**/*",
+          "!pi-launcher.mjs",
+          "!desktop-command-guard.mjs",
+          "!desktop-session-controls.mjs"
         ]
       },
       {
@@ -83,6 +86,10 @@
       {
         "from": "electron/desktop-command-guard.mjs",
         "to": "runtime/desktop-command-guard.mjs"
+      },
+      {
+        "from": "electron/desktop-session-controls.mjs",
+        "to": "runtime/desktop-session-controls.mjs"
       }
     ],
     "electronDist": "node_modules/electron/dist",

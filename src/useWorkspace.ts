@@ -14,6 +14,7 @@ export function useWorkspace(api: PiDesktopApi | undefined) {
   const epochs = useRef(new Map<string, number>());
   const eventRevisions = useRef(new Map<string, number>());
   const connectionRevision = useRef(0);
+  const forgotten = useRef(new Set<string>());
   const refreshView = useRef<(id: string) => Promise<void>>(async () => {});
   const dialogTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const renderFrame = useRef<number | null>(null);
@@ -48,11 +49,18 @@ export function useWorkspace(api: PiDesktopApi | undefined) {
   }, [update]);
   const load = useCallback((connection: Connection, activate = true, requestRevision?: number) => {
     const id = connection.connectionId || 'legacy';
+    if (forgotten.current.has(id)) return id;
     let savedDraft = '';
     try { savedDraft = localStorage.getItem(draftKey(connection.project, connection.state.sessionId)) || ''; } catch { /* Optional draft cache. */ }
     const newerEvents = requestRevision !== undefined && (eventRevisions.current.get(id) || 0) !== requestRevision;
     epochs.current.set(id, (epochs.current.get(id) || 0) + 1);
-    const next = receiveConnection(viewsRef.current[id], connection, savedDraft, newerEvents);
+    const previous = viewsRef.current[id];
+    const next = receiveConnection(previous, connection, savedDraft, newerEvents);
+    // An unsent restored tab receives a new Pi session, while its editor stays intact.
+    if (previous?.restoring && !previous.messages.length) {
+      next.draft = previous.draft; next.attachments = previous.attachments; next.sendMode = previous.sendMode;
+    }
+    next.restoring = false;
     if (!activate) next.unread = viewsRef.current[id]?.unread || false;
     const all = { ...viewsRef.current, [id]: next };
     publish(all);
@@ -61,10 +69,17 @@ export function useWorkspace(api: PiDesktopApi | undefined) {
     return id;
   }, [publish]);
   const forget = useCallback((id: string) => {
+    forgotten.current.add(id);
     epochs.current.set(id, (epochs.current.get(id) || 0) + 1);
     const all = { ...viewsRef.current };
     delete all[id]; publish(all);
     if (activeIdRef.current === id) { activeIdRef.current = WELCOME; setActiveId(WELCOME); }
+  }, [publish]);
+  const hydrate = useCallback((cached: Record<string, ConversationView>, selected: string | null) => {
+    const all: Record<string, ConversationView> = { [WELCOME]: emptyConversation(WELCOME), ...cached };
+    publish(all);
+    const id = selected && all[selected] ? selected : WELCOME;
+    activeIdRef.current = id; setActiveId(id);
   }, [publish]);
 
   useEffect(() => {
@@ -91,14 +106,14 @@ export function useWorkspace(api: PiDesktopApi | undefined) {
     const unsubscribe = api.onEvent(event => {
       if (event.type === 'connections_changed') { connectionRevision.current++; setConnections(event.connections || []); return; }
       const id = event.connectionId || (activeIdRef.current !== WELCOME ? activeIdRef.current : undefined);
-      if (!id) return;
+      if (!id || forgotten.current.has(id)) return;
       if (!viewsRef.current[id]) {
         const all = { ...viewsRef.current, [id]: emptyConversation(id, event.project || '') };
         viewsRef.current = all;
       }
       const disconnected = event.type === 'connection_status' && ['error', 'disconnected'].includes(event.status);
       if (event.type === 'agent_start' || disconnected) epochs.current.set(id, (epochs.current.get(id) || 0) + 1);
-      if ((event.type !== 'connection_status' && event.type !== 'diagnostic') || disconnected) eventRevisions.current.set(id, (eventRevisions.current.get(id) || 0) + 1);
+      if (!['connection_status', 'diagnostic', 'desktop_capabilities'].includes(event.type) || disconnected) eventRevisions.current.set(id, (eventRevisions.current.get(id) || 0) + 1);
       // Keep event state current synchronously, but paint streamed bursts once
       // per frame so parallel output does not flood the renderer with commits.
       update(id, previous => applyConversationEvent(previous, event, Date.now(), id !== activeIdRef.current), event.type === 'message_update' || event.type === 'tool_execution_update');
@@ -138,5 +153,5 @@ export function useWorkspace(api: PiDesktopApi | undefined) {
     const field = <K extends keyof ConversationView>(key: K): ViewSetter<K> => value => update(activeId, previous => ({ ...previous, [key]: typeof value === 'function' ? (value as (current: ConversationView[K]) => ConversationView[K])(previous[key]) : value }));
     return { setStatus: field('status'), setProject: field('project'), setState: field('state'), setMessages: field('messages'), setModels: field('models'), setCommands: field('commands'), setStats: field('stats'), setLevels: field('levels'), setBusy: field('busy'), setMutating: field('mutating'), setProgress: field('progress'), setDraft: field('draft'), setAttachments: field('attachments'), setSendMode: field('sendMode'), setQueue: field('queue'), setTools: field('tools'), setNotice: field('notice'), setDialogs: field('dialogs'), setWidgets: field('widgets'), setStatuses: field('statuses') };
   }, [activeId, update]);
-  return { activeId, activeIdRef, views, viewsRef, eventRevisions, snapshotEpochs: epochs, view: views[activeId] || views[WELCOME], connections, setters, update, load, select, forget };
+  return { activeId, activeIdRef, views, viewsRef, eventRevisions, snapshotEpochs: epochs, view: views[activeId] || views[WELCOME], connections, setters, update, load, select, forget, hydrate };
 }

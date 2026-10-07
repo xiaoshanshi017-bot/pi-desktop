@@ -1,8 +1,9 @@
 import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
+import { randomUUID } from 'node:crypto';
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { basename, extname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Connection, FileAttachment, Preferences, RpcRecord } from '../shared/types';
+import type { BootstrapOptions, ConnectOptions, Connection, FileAttachment, Preferences, RpcRecord } from '../shared/types';
 import { desktopProgressGuidance } from '../shared/progress-guidance';
 import { discoverDiagnostics } from './diagnostics';
 import { createPiLaunchOptions } from './runtime';
@@ -12,6 +13,7 @@ import { resolveSessionRestore } from './session-restore';
 import { ConnectionPool, type ManagedConnection } from './connections';
 import { PiRpcClient } from './rpc';
 import { listSessions, PreferenceStore, readSessionHeader, readSessionInfo, samePath } from './storage';
+import { WorkspaceStore } from './workspace-store';
 
 if (process.env.PI_DESKTOP_USER_DATA) app.setPath('userData', resolve(process.env.PI_DESKTOP_USER_DATA));
 app.setName('Pi Desktop');
@@ -20,6 +22,9 @@ let connections: ConnectionPool;
 let allowClose = false;
 let closePending = false;
 let store: PreferenceStore;
+let workspaceStore: WorkspaceStore;
+let workspaceFrozen = false;
+let pendingWorkspaceFlush: { id: string; done(): void } | undefined;
 const expectedVersion = '0.84.2';
 const devUrl = process.env.PI_DESKTOP_DEV_URL;
 const runtimeRoot = app.isPackaged ? join(process.resourcesPath, 'runtime') : join(app.getAppPath(), 'build', 'runtime', 'win32-x64');
@@ -137,13 +142,16 @@ function createConnections(): ConnectionPool {
   });
 }
 async function connect(projectValue: unknown, sessionValue?: unknown, optionsValue?: unknown): Promise<Connection> {
-  if (optionsValue !== undefined && (!optionsValue || typeof optionsValue !== 'object' || Array.isArray(optionsValue) || ('newSession' in optionsValue && typeof (optionsValue as RpcRecord).newSession !== 'boolean'))) throw new Error('新会话选项无效。');
-  const options = optionsValue as { newSession?: boolean } | undefined;
+  if (optionsValue !== undefined && (!optionsValue || typeof optionsValue !== 'object' || Array.isArray(optionsValue))) throw new Error('新会话选项无效。');
+  const options = optionsValue as ConnectOptions | undefined;
+  for (const field of ['newSession', 'background', 'restoring'] as const) if (options?.[field] !== undefined && typeof options[field] !== 'boolean') throw new Error('新会话选项无效。');
+  if (options?.connectionId !== undefined && (text(options.connectionId, '缓存会话 ID', 200) === 'welcome')) throw new Error('缓存会话 ID 无效。');
   const project = await projectPath(projectValue);
   const requestedSession = options?.newSession || sessionValue === undefined ? undefined : resolve(text(sessionValue, '会话路径'));
   const restored = await resolveSessionRestore(project, requestedSession);
-  const result = await connections.connect(project, restored.sessionPath ? await realpath(restored.sessionPath) : undefined, restored.missing ? { newSession: true } : options);
-  await rememberOpened(result);
+  if (options?.restoring && restored.missing) throw new Error('保存的会话文件已不存在，本地视图缓存仍会保留。');
+  const result = await connections.connect(project, restored.sessionPath ? await realpath(restored.sessionPath) : undefined, restored.missing ? { ...options, newSession: true } : options);
+  if (!options?.background) await rememberOpened(result);
   if (restored.missing) {
     const lastSessions = { ...store.get().lastSessions };
     for (const [savedProject, savedSession] of Object.entries(lastSessions)) {
@@ -210,9 +218,10 @@ async function chooseFiles(): Promise<FileAttachment[]> {
 }
 
 function registerIpc(): void {
-  handle('pi:bootstrap', async () => {
+  handle('pi:bootstrap', async (options?: BootstrapOptions) => {
+    if (options !== undefined && (!options || typeof options !== 'object' || Array.isArray(options) || (options.workspace !== undefined && typeof options.workspace !== 'boolean'))) throw new Error('启动选项无效。');
     const diagnostics = await discoverDiagnostics(store.get(), { runtimeRoot, packaged: app.isPackaged });
-    return { preferences: store.get(), diagnostics, version: app.getVersion(), modelConfig: await readModelConfigSummary(diagnostics.agentDir) };
+    return { preferences: store.get(), diagnostics, version: app.getVersion(), modelConfig: await readModelConfigSummary(diagnostics.agentDir), ...(options?.workspace !== false ? { workspace: workspaceStore.get() } : {}) };
   });
   handle('pi:chooseProject', async () => {
     const result = await dialog.showOpenDialog(window!, { title: '打开项目文件夹', properties: ['openDirectory'], defaultPath: store.get().lastProject });
@@ -242,6 +251,14 @@ function registerIpc(): void {
     if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('设置格式无效。');
     return store.save(patch);
   });
+  handle('pi:saveWorkspace', async value => {
+    // Once the close-time snapshot is durable, disconnect events must not
+    // overwrite its open tabs with an empty workspace during shutdown.
+    if (!workspaceFrozen) await workspaceStore.save(value);
+  });
+  handle('pi:workspaceFlushed', value => {
+    if (typeof value === 'string' && value === pendingWorkspaceFlush?.id) pendingWorkspaceFlush.done();
+  });
   handle('pi:rpc', async (value, idValue) => {
     const command = validateCommand(value);
     const id = connectionId(idValue);
@@ -253,6 +270,11 @@ function registerIpc(): void {
     }
     const data = await connections.rpc(command, active.id);
     return publicRpcData(command.type, data);
+  });
+  handle('pi:redirect', async (value, idValue) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['message', 'images'].includes(key))) throw new Error('任务调整格式无效。');
+    const command = validateCommand({ type: 'prompt', message: value.message, ...(value.images !== undefined ? { images: value.images } : {}) });
+    return connections.redirect({ message: command.message, ...(command.images ? { images: command.images.map((image: RpcRecord) => ({ type: 'image', data: image.data, mimeType: image.mimeType })) } : {}) }, connectionId(idValue));
   });
   handle('pi:respondUI', (value, idValue) => {
     if (!value || typeof value.id !== 'string') throw new Error('扩展回复无效。');
@@ -270,6 +292,24 @@ function registerIpc(): void {
     await stat(path);
     shell.showItemInFolder(path);
   });
+}
+
+async function flushRendererWorkspace(): Promise<void> {
+  if (window && !window.isDestroyed()) {
+    await new Promise<void>(resolve => {
+      const id = randomUUID();
+      const done = () => { clearTimeout(timeout); if (pendingWorkspaceFlush?.id === id) pendingWorkspaceFlush = undefined; resolve(); };
+      const timeout = setTimeout(done, 2_000);
+      pendingWorkspaceFlush = { id, done };
+      window!.webContents.send('pi:workspaceFlush', id);
+    });
+  }
+  try {
+    await workspaceStore.flush();
+  } finally {
+    // Preserve the last recoverable cache even when its final write fails.
+    workspaceFrozen = true;
+  }
 }
 
 async function createWindow(): Promise<void> {
@@ -291,7 +331,13 @@ async function createWindow(): Promise<void> {
         const result = await dialog.showMessageBox(window!, { type: 'question', title: '任务仍在运行', message: '停止所有任务并退出 Pi Desktop？', detail: `还有 ${connections.busyCount} 个会话正在运行。Pi 会保留已经保存的会话。`, buttons: ['继续运行', '停止并退出'], defaultId: 0, cancelId: 0, noLink: true });
         if (result.response !== 1) { closePending = false; return; }
       }
-      await connections.stopAll();
+      try {
+        await flushRendererWorkspace();
+      } finally {
+        // A cache write failure still needs orderly child-process shutdown.
+        await connections.stopAll();
+      }
+      await workspaceStore.flush();
       allowClose = true;
       window?.close();
     })().catch(() => { allowClose = true; window?.close(); });
@@ -307,7 +353,8 @@ else {
   app.on('second-instance', () => { if (window?.isMinimized()) window.restore(); window?.focus(); });
   app.whenReady().then(async () => {
     store = new PreferenceStore(join(app.getPath('userData'), 'preferences.json'));
-    await store.load();
+    workspaceStore = new WorkspaceStore(join(app.getPath('userData'), 'workspace.json'));
+    await Promise.all([store.load(), workspaceStore.load()]);
     connections = createConnections();
     registerIpc();
     await createWindow();

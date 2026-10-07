@@ -103,6 +103,35 @@ test('RPC remains busy after prompt acceptance and low-level agent_end until age
   assert.equal(client.busy, false);
 });
 
+test('idle barrier waits for preflight responses, compaction responses and agent_settled rather than early end events', async t => {
+  const endedBusy: boolean[] = [];
+  const client = startFixture(event => {
+    if (event.type === 'agent_end' || event.type === 'compaction_end') endedBusy.push(client.busy);
+  });
+  t.after(() => client.stop());
+  const preflight = client.request({ type: 'prompt', preflightOnly: true });
+  assert.equal(client.busy, true);
+  await client.waitForIdle(); await preflight;
+  const compact = client.request({ type: 'compact' });
+  await client.waitForIdle(); await compact;
+  await client.request({ type: 'prompt' });
+  await client.waitForIdle();
+  assert.deepEqual(endedBusy, [true, true]);
+  assert.equal(client.busy, false);
+});
+
+test('idle barrier cancellation and child exit reject without sending any replacement prompt', async t => {
+  const client = startFixture();
+  t.after(() => client.stop());
+  await client.request({ type: 'prompt' });
+  const controller = new AbortController();
+  const cancelled = assert.rejects(client.waitForIdle({ signal: controller.signal }), /取消/);
+  controller.abort(); await cancelled;
+  const crashed = assert.rejects(client.waitForIdle(), /进程退出/);
+  await assert.rejects(client.request({ type: 'crash' }));
+  await crashed;
+});
+
 test('RPC shutdown rejects pending requests and is idempotent', async () => {
   const client = startFixture();
   await client.request({ type: 'echo' });

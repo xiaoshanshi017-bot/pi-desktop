@@ -25,6 +25,7 @@ function projectName(project: string) {
 function conversationStatus(item: ActiveConversationItem) {
   if (item.status === 'attention') return '待确认';
   if (item.status === 'error') return '连接出错';
+  if (item.status === 'restoring') return '恢复连接中';
   if (item.status === 'starting' || item.status === 'connecting') return '连接中';
   if (item.busy) return '运行中';
   if (item.unread) return '已完成';

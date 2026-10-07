@@ -108,6 +108,7 @@ kbd { font: inherit; font-size: 11px; color: var(--muted); }
 .breadcrumb:hover .icon-button { opacity: 1; }
 .topbar-actions { display: flex; align-items: center; gap: 15px; flex-shrink: 0; }
 .connection-pill { display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--muted); }
+.workspace-restore-note { display: flex; align-items: center; gap: 7px; padding: 7px 2px; font-size: 11px; color: var(--muted); }
 .connection-pill.connected { color: #789d8d; }
 .chat-main { display: flex; flex-direction: column; flex: 1; min-height: 0; position: relative; }
 .chat-toolbar { min-height: 42px; padding: 0 22px; display: flex; align-items: center; gap: 11px; flex-shrink: 0; border-bottom: 1px solid color-mix(in srgb, var(--border) 65%, transparent); background: var(--bg); }
@@ -380,6 +381,13 @@ code, pre { font-family: 'Cascadia Code', Consolas, 'Courier New', monospace; }
 .queue-list > div { display: flex; align-items: baseline; gap: 7px; font-size: 11px; color: var(--secondary); }
 .queue-list > div > span { flex-shrink: 0; color: var(--purple); font-size: 11px; }
 .queue-list p { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; margin: 5px 0; }
+.queue-delivery-hint { padding: 4px 0; font-size: 10px; color: var(--muted); }
+.redirect-pending, .redirect-result { display: flex; align-items: flex-start; gap: 9px; padding: 10px 12px; margin-bottom: 8px; border: 1px solid var(--border); border-radius: 9px; background: var(--purple-soft); color: var(--secondary); }
+.redirect-pending > svg, .redirect-result > svg { flex-shrink: 0; margin-top: 2px; color: var(--purple); }
+.redirect-copy { flex: 1; min-width: 0; font-size: 11px; }
+.redirect-copy strong { font-weight: 500; }
+.redirect-copy p { margin: 4px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.redirect-pending > button, .redirect-result > button { flex-shrink: 0; font-size: 11px; }
 .extension-widget { border-left: 2px solid var(--purple); padding: 4px 11px; color: var(--secondary); font: 11px/1.7 Consolas, monospace; white-space: pre-wrap; margin-bottom: 9px; max-height: 130px; overflow-y: auto; }
 .command-menu { position: absolute; left: 31px; right: 31px; bottom: calc(100% - 5px); z-index: 4; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 7px; box-shadow: 0 10px 35px #22203318; max-height: 310px; overflow-y: auto; }
 .command-menu-heading { display: flex; align-items: center; justify-content: space-between; padding: 0 7px 5px; color: var(--muted); font-size: 11px; }

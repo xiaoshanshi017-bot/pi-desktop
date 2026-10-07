@@ -1,9 +1,17 @@
 import { randomUUID } from 'node:crypto';
-import type { Connection, ConnectionSummary, RpcRecord } from '../shared/types';
+import type { ConnectOptions, Connection, ConnectionSummary, RedirectPrompt, RedirectResult, RpcRecord } from '../shared/types';
 import type { PiRpcClient } from './rpc';
 import { samePath } from './storage';
 
-export type ConnectionClient = Pick<PiRpcClient, 'running' | 'busy' | 'start' | 'stop' | 'request' | 'send'>;
+export type ConnectionClient = Pick<PiRpcClient, 'running' | 'busy' | 'hasSessionControls' | 'waitForIdle' | 'start' | 'stop' | 'request' | 'send'>;
+interface RedirectRequest {
+  id: string; prompt: RedirectPrompt; signature: string; promise: Promise<RedirectResult>;
+  resolve(result: RedirectResult): void; reject(error: Error): void;
+}
+interface RedirectControl {
+  latest: RedirectRequest; signal: AbortController; phase: 'stopping' | 'submitting';
+  revision: number; extraAbort?: Promise<RpcRecord>;
+}
 export interface ManagedConnection {
   readonly id: string;
   readonly project: string;
@@ -16,11 +24,13 @@ export interface ManagedConnection {
   client?: ConnectionClient;
   connecting?: Promise<Connection>;
   mutation: boolean;
+  mutationType?: string;
   mutationDone?: Promise<void>;
   changingSession?: boolean;
   reservedSessionPaths?: string[];
   closing: boolean;
   closingPromise?: Promise<void>;
+  redirect?: RedirectControl;
 }
 interface ConnectionPoolOptions {
   createClient(project: string, sessionPath: string | undefined, onEvent: (event: RpcRecord) => void): Promise<ConnectionClient> | ConnectionClient;
@@ -41,7 +51,7 @@ export class ConnectionPool {
   constructor(private readonly options: ConnectionPoolOptions) {}
   get activeConnectionId(): string | undefined { return this.activeId; }
   isLatestSelection(entry: ManagedConnection): boolean {
-    return ![...this.entries.values()].some(other => samePath(other.project, entry.project) && other.selectionOrder > entry.selectionOrder);
+    return entry.selectionOrder > 0 && ![...this.entries.values()].some(other => samePath(other.project, entry.project) && other.selectionOrder > entry.selectionOrder);
   }
   get busyCount(): number { return this.list().filter(connection => connection.busy).length; }
   private summary(entry: ManagedConnection): ConnectionSummary {
@@ -58,13 +68,20 @@ export class ConnectionPool {
     if (!entry || entry.closing || !entry.client?.running) throw new Error('请先打开项目并连接 Pi。');
     return entry;
   }
-  private isBusy(entry: ManagedConnection): boolean { return Boolean(entry.connecting || entry.mutation || entry.client?.busy); }
+  private isBusy(entry: ManagedConnection): boolean { return Boolean(entry.connecting || entry.mutation || entry.redirect || entry.client?.busy); }
   private changed(): void { this.options.onEvent({ type: 'connections_changed', connections: this.list(), activeConnectionId: this.activeId }); }
   private emit(entry: ManagedConnection, event: RpcRecord): void {
     if (this.entries.get(entry.id) !== entry) return;
     entry.lastActivity = Date.now();
     if (event.type === 'connection_status') entry.status = event.status;
     this.options.onEvent({ ...event, connectionId: entry.id, project: entry.project });
+    if (event.type === 'agent_start' && entry.redirect?.phase === 'stopping' && !entry.redirect.signal.signal.aborted && !entry.redirect.extraAbort) {
+      // A prompt that was still in preflight when Stop arrived can start late.
+      // Interrupt that old run too; the replacement prompt uses submitting phase.
+      const control = entry.redirect;
+      control.extraAbort = entry.client!.request({ type: 'abort' }, 60_000);
+      void control.extraAbort.catch(() => {});
+    }
     if (event.type === 'connection_status' || activityEvents.has(event.type)) this.changed();
     if (event.type === 'agent_settled' && !entry.closing) {
       const revision = entry.revision;
@@ -96,8 +113,21 @@ export class ConnectionPool {
     await this.refreshState(entry, revision, state);
     return { connectionId: entry.id, project: entry.project, state, messages: messages.messages ?? [], models: models.models ?? [], commands: commands.commands ?? [], stats };
   }
-  async connect(project: string, sessionPath?: string, options: { newSession?: boolean } = {}): Promise<Connection> {
+  async connect(project: string, sessionPath?: string, options: ConnectOptions = {}): Promise<Connection> {
     if (this.stopping) throw new Error('Pi Desktop 正在退出。');
+    if (options.connectionId) {
+      const named = this.entries.get(options.connectionId);
+      if (named && sessionPath && named.changingSession && named.mutationDone) {
+        await named.mutationDone;
+        return this.connect(project, sessionPath, options);
+      }
+      if (named && (!samePath(named.project, project) || (sessionPath && !this.ownsSession(named, sessionPath)) || options.newSession)) throw new Error('这个缓存会话 ID 已被另一个项目或会话使用。');
+      if (named?.closingPromise) {
+        await named.closingPromise;
+        return this.connect(project, sessionPath, options);
+      }
+      if (named && (named.connecting || named.client?.running)) return options.background ? named.connecting ?? this.snapshot(named) : this.activate(named.id);
+    }
     if (!options.newSession) {
       if (sessionPath) {
         const closing = [...this.entries.values()].find(entry => entry.closing && this.ownsSession(entry, sessionPath!));
@@ -110,18 +140,19 @@ export class ConnectionPool {
       const targetSession = sessionPath;
       const existing = targetSession
         ? candidates.find(entry => this.ownsSession(entry, targetSession))
-        : candidates.find(entry => entry.id === this.activeId) ?? candidates.sort((a, b) => b.selectionOrder - a.selectionOrder)[0];
+        : options.connectionId ? undefined : candidates.find(entry => entry.id === this.activeId) ?? candidates.sort((a, b) => b.selectionOrder - a.selectionOrder)[0];
       if (existing) {
         if (targetSession && existing.changingSession && existing.mutationDone) {
           await existing.mutationDone;
           return this.connect(project, targetSession, options);
         }
-        return this.activate(existing.id);
+        if (options.restoring && options.connectionId && existing.id !== options.connectionId) throw new Error('同一会话已由另一标签恢复，请切换到该标签；本地视图缓存仍会保留。');
+        return options.background ? existing.connecting ?? this.snapshot(existing) : this.activate(existing.id);
       }
     } else sessionPath = undefined;
-    const entry: ManagedConnection = { id: randomUUID(), project, sessionPath, status: 'connecting', lastActivity: Date.now(), selectionOrder: ++this.selectionOrder, revision: 0, mutation: false, closing: false };
+    const entry: ManagedConnection = { id: options.connectionId ?? randomUUID(), project, sessionPath, status: 'connecting', lastActivity: Date.now(), selectionOrder: options.background ? 0 : ++this.selectionOrder, revision: 0, mutation: false, closing: false };
     this.entries.set(entry.id, entry);
-    this.activeId = entry.id;
+    if (!options.background) this.activeId = entry.id;
     // Reserve the session path synchronously before invoking an asynchronous launcher.
     entry.connecting = Promise.resolve().then(() => this.start(entry));
     this.changed();
@@ -169,8 +200,86 @@ export class ConnectionPool {
   private ownsSession(entry: ManagedConnection, path: string): boolean {
     return [entry.sessionPath, ...(entry.reservedSessionPaths ?? [])].some(candidate => Boolean(candidate && samePath(candidate, path)));
   }
+  private redirectEvent(entry: ManagedConnection, request: RedirectRequest, status: string, error?: string): void {
+    this.emit(entry, { type: 'redirect_update', requestId: request.id, status, message: request.prompt.message, ...(error ? { error } : {}) });
+    this.changed();
+  }
+  async redirect(prompt: RedirectPrompt, id?: string): Promise<RedirectResult> {
+    const entry = this.get(id);
+    if (entry.connecting || (entry.mutation && entry.mutationType !== 'compact')) throw new Error('这个会话正在切换设置，请等待完成后再调整。');
+    if (!entry.client!.hasSessionControls) throw new Error('当前 Pi 连接未加载桌面中断适配器，无法保证清除旧排队要求。请使用新版内置 Pi 重新连接后立即调整。');
+    const signature = JSON.stringify(prompt);
+    if (entry.redirect?.latest.signature === signature && !entry.redirect.signal.signal.aborted) return entry.redirect.latest.promise;
+    let resolve!: (result: RedirectResult) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<RedirectResult>((yes, no) => { resolve = yes; reject = no; });
+    const request: RedirectRequest = { id: randomUUID(), prompt, signature, promise, resolve, reject };
+    let control = entry.redirect;
+    if (control) {
+      control.latest.resolve({ requestId: control.latest.id, status: 'superseded', superseded: true });
+      control.latest = request;
+    } else {
+      control = { latest: request, signal: new AbortController(), phase: 'stopping', revision: entry.revision };
+      entry.redirect = control;
+      const worker = control;
+      void Promise.resolve().then(() => this.runRedirect(entry, worker));
+    }
+    // Every accepted ticket first announces itself, including an idle session.
+    this.redirectEvent(entry, request, 'stopping');
+    return promise;
+  }
+  private validRedirect(entry: ManagedConnection, control: RedirectControl): boolean {
+    return !control.signal.signal.aborted && !entry.closing && this.entries.get(entry.id) === entry && entry.redirect === control && entry.revision === control.revision && Boolean(entry.client?.running);
+  }
+  private ensureRedirect(entry: ManagedConnection, control: RedirectControl): boolean {
+    if (control.signal.signal.aborted || entry.redirect !== control) return false;
+    if (!this.validRedirect(entry, control)) throw new Error('会话已断开或变更；新的要求尚未发送。');
+    return true;
+  }
+  private async runRedirect(entry: ManagedConnection, control: RedirectControl): Promise<void> {
+    try {
+      while (this.ensureRedirect(entry, control)) {
+        control.phase = 'stopping';
+        await entry.client!.request({ type: 'abort' }, 60_000);
+        if (!this.ensureRedirect(entry, control)) return;
+        await entry.client!.waitForIdle({ signal: control.signal.signal, timeoutMs: 60_000 });
+        if (control.extraAbort) { await control.extraAbort; control.extraAbort = undefined; }
+        if (entry.mutationDone) await entry.mutationDone;
+        if (!this.ensureRedirect(entry, control)) return;
+        const request = control.latest;
+        control.phase = 'submitting';
+        this.redirectEvent(entry, request, 'submitting');
+        if (!this.ensureRedirect(entry, control)) return;
+        await entry.client!.request({ type: 'prompt', message: request.prompt.message, ...(request.prompt.images?.length ? { images: request.prompt.images } : {}) }, 10 * 60_000);
+        if (!this.ensureRedirect(entry, control)) return;
+        if (control.latest !== request) continue;
+        request.resolve({ requestId: request.id, status: 'submitted' });
+        this.redirectEvent(entry, request, 'submitted');
+        if (control.latest !== request) continue;
+        return;
+      }
+    } catch (error) {
+      if (entry.redirect === control && !control.signal.signal.aborted) {
+        const failure = error instanceof Error ? error : new Error(String(error));
+        control.latest.reject(failure);
+        this.redirectEvent(entry, control.latest, 'error', failure.message);
+      }
+    } finally {
+      if (entry.redirect === control) { entry.redirect = undefined; this.changed(); }
+    }
+  }
+  private cancelRedirect(entry: ManagedConnection): void {
+    const control = entry.redirect;
+    if (!control) return;
+    control.signal.abort();
+    entry.redirect = undefined;
+    control.latest.resolve({ requestId: control.latest.id, status: 'cancelled', cancelled: true });
+    this.redirectEvent(entry, control.latest, 'cancelled');
+  }
   async rpc(command: RpcRecord, id?: string): Promise<RpcRecord> {
     const entry = this.get(id);
+    if (command.type === 'abort') this.cancelRedirect(entry);
+    if (entry.redirect && ['prompt', 'steer', 'follow_up', 'bash'].includes(command.type)) throw new Error('正在中断并调整当前任务，请等待交接完成后再发送。');
     const exclusive = exclusiveCommands.has(command.type);
     let finishMutation: (() => void) | undefined;
     if (!exclusive && (entry.connecting || entry.mutation) && ['prompt', 'steer', 'follow_up', 'bash'].includes(command.type)) throw new Error('这个会话正在切换设置，请等待完成后再发送。');
@@ -181,6 +290,7 @@ export class ConnectionPool {
         if (owner) throw new Error('目标会话已经打开，请切换到该会话，避免重复写入。');
       }
       entry.mutation = true;
+      entry.mutationType = command.type;
       entry.mutationDone = new Promise<void>(resolve => { finishMutation = resolve; });
       if (sessionCommands.has(command.type)) {
         entry.changingSession = true;
@@ -204,6 +314,7 @@ export class ConnectionPool {
     } finally {
       if (exclusive) {
         entry.mutation = false;
+        entry.mutationType = undefined;
         entry.changingSession = false;
         entry.reservedSessionPaths = undefined;
         entry.mutationDone = undefined;
@@ -217,6 +328,7 @@ export class ConnectionPool {
     const entry = id && this.entries.get(id);
     if (!entry) return;
     if (entry.closingPromise) return entry.closingPromise;
+    this.cancelRedirect(entry);
     entry.closing = true;
     entry.revision++;
     entry.closingPromise = Promise.resolve().then(async () => {

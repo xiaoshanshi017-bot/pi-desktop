@@ -29,10 +29,16 @@ process.stdin.on('data', chunk => {
         reply(command);
         break;
       case 'prompt':
+        if (command.preflightOnly) { setTimeout(() => reply(command), command.delay || 80); break; }
         emit({ type: 'agent_start' });
         reply(command);
         setTimeout(() => emit({ type: 'agent_end', messages: [], willRetry: false }), 20);
         setTimeout(() => emit({ type: 'agent_settled' }), 80);
+        break;
+      case 'compact':
+        emit({ type: 'compaction_start' });
+        setTimeout(() => emit({ type: 'compaction_end' }), 20);
+        setTimeout(() => reply(command), 80);
         break;
       case 'extension_ui_response':
         emit({ type: 'fixture_ui_received', id: command.id, confirmed: command.confirmed });

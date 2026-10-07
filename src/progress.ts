@@ -1,5 +1,6 @@
 import type { RpcRecord } from '../shared/types';
 import { textContent } from './conversation';
+import { isCancelledMessage } from './cancellation';
 
 export const toolNames: Record<string, string> = { read: '读取文件', write: '写入文件', edit: '编辑文件', bash: '执行命令', grep: '搜索内容', find: '查找文件', ls: '浏览目录' };
 export const toolLabel = (name: string) => toolNames[name] || name || '执行工具';
@@ -30,6 +31,8 @@ export interface RunProgress {
   stopRequested?: boolean;
   assistantError?: string;
   aborted?: boolean;
+  redirectRequestId?: string;
+  redirectHadRun?: boolean;
 }
 
 const finishStages = (steps: ProgressStep[], now: number) => steps.map(step => step.kind === 'stage' && step.status === 'running' ? { ...step, status: 'done' as const, endedAt: now } : step);
@@ -54,6 +57,25 @@ function finish(progress: RunProgress, phase: 'complete' | 'error' | 'interrupte
 
 /** Progress is derived only from observed events, never from hidden reasoning or a guessed percentage. */
 export function applyProgressEvent(previous: RunProgress | null, event: RpcRecord, now = Date.now()): RunProgress | null {
+  if (event.type === 'redirect_update') {
+    if (event.status === 'stopping') {
+      const activePrevious = previous && previous.endedAt === undefined ? previous : null;
+      const progress = activePrevious || start(now);
+      const redirectHadRun = activePrevious ? activePrevious.redirectRequestId ? activePrevious.redirectHadRun : true : false;
+      return { ...stage(progress, 'stopping', '正在调整任务', '停止当前执行后按新要求继续', now), stopRequested: true, redirectRequestId: event.requestId, redirectHadRun };
+    }
+    if (!previous || previous.redirectRequestId !== event.requestId || previous.endedAt !== undefined) return previous;
+    // Submitting is emitted only after the backend has observed a real idle state.
+    // An idle redirect has no old agent_settled event; end its waiting indicator here.
+    if (event.status === 'submitting') return finish(previous, 'interrupted', '正在提交新的要求，等待 Pi 开始新一轮。', now);
+    if (event.status === 'cancelled') return previous.redirectHadRun
+      ? { ...stage(previous, 'stopping', '正在停止任务', '新指令已取消，等待当前操作中止并保存会话', now), stopRequested: true }
+      : { ...finish(previous, 'interrupted', '本次调整已取消。', now), label: '调整已取消' };
+    if (event.status === 'error') return previous.redirectHadRun
+      ? applyProgressEvent({ ...previous, redirectRequestId: undefined, redirectHadRun: undefined }, { type: 'stop_failed' }, now)
+      : finish(previous, 'error', event.error || '未能提交调整，请重试。', now);
+    return previous;
+  }
   if (event.type === 'prompt_submitted' || event.type === 'agent_start') return previous && previous.endedAt === undefined ? previous : start(now);
   if ((!previous || previous.endedAt !== undefined) && ['compaction_start', 'auto_compaction_start'].includes(event.type)) previous = start(now);
   if (!previous || previous.endedAt !== undefined) return previous;
@@ -75,7 +97,7 @@ export function applyProgressEvent(previous: RunProgress | null, event: RpcRecor
     if (/^text_(start|delta)$/.test(type)) return stage(progress, 'responding', '正在输出说明', '进展与回复正在显示到会话中', now);
     if (/^toolcall_(start|delta)$/.test(type)) return stage(progress, 'preparing', '正在准备工具调用', '正在生成工具参数，尚未开始执行', now);
   }
-  if (event.type === 'message_end' && event.message?.role === 'assistant') return { ...progress, assistantError: event.message.errorMessage, aborted: progress.aborted || event.message.stopReason === 'aborted', updatedAt: now };
+  if (event.type === 'message_end' && event.message?.role === 'assistant') return { ...progress, assistantError: isCancelledMessage(event.message) ? undefined : event.message.errorMessage, aborted: progress.aborted || isCancelledMessage(event.message), updatedAt: now };
   if (event.type === 'tool_execution_start') {
     const id = event.toolCallId;
     if (!id) return progress;
