@@ -15,6 +15,7 @@ Pi Desktop 用 Electron 和 React 为 [Pi Coding Agent](https://github.com/earen
 - 重开应用恢复全部已打开的会话、当前标签、草稿、附件与阅读位置；先展示磁盘缓存，再后台连接 Pi。
 - 任务进度显示当前阶段、耗时与工具调用记录；收起的工具卡片也显示最新五行日志，15 秒无新输出时提示等待时长。
 - 自定义模型搜索与分组；按模型能力选择带中英文说明的思考档位。
+- 在设置中填写 OpenAI 兼容服务的 API 地址与 Key，获取、搜索和多选添加模型。
 - 多项目入口、历史搜索、会话恢复、重命名、分支和上下文压缩。
 - 导入已有 Pi / Pi Web 项目，沿用模型配置与历史，不移动项目代码。
 - 图片与文本附件、扩展弹窗、Skills、提示模板、任务引导和后续消息。
@@ -24,7 +25,7 @@ Pi Desktop 用 Electron 和 React 为 [Pi Coding Agent](https://github.com/earen
 
 ## 安装与使用
 
-从 [GitHub Releases](https://github.com/xiaoshanshi017-bot/pi-desktop/releases/latest) 下载 `Pi-Desktop-Setup-0.2.5-x64.exe` 并安装。日常使用推荐安装版，内置环境只需展开一次。也提供 `Pi-Desktop-0.2.5-x64.exe` 单文件便携版，启动时会展开运行环境。变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+从 [GitHub Releases](https://github.com/xiaoshanshi017-bot/pi-desktop/releases/latest) 下载 `Pi-Desktop-Setup-0.2.8-x64.exe` 并安装。日常使用推荐安装版，内置环境只需展开一次。也提供 `Pi-Desktop-0.2.8-x64.exe` 单文件便携版，启动时会展开运行环境。变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 安装客户端后无需单独安装 Pi、Node 或 Git Bash。模型仍需自己的 API 密钥或服务商登录；Pi Desktop 不附赠模型服务。已有 Pi 用户默认继续使用 `~/.pi/agent` 下的模型配置、凭据和 JSONL 会话，也尊重 Pi 的代理目录环境变量。
 
@@ -47,6 +48,10 @@ Pi Desktop 用 Electron 和 React 为 [Pi Coding Agent](https://github.com/earen
 在“导入 Pi Web 项目”中扫描并选择已有项目。导入保存项目入口，不复制凭据、不移动代码或会话，也不会接管网页版运行中的任务。任务结束后再从桌面客户端恢复同一会话。
 
 设置中的“关于 Pi Desktop”包含上游、客户端源码与许可链接。“运行环境”显示 Pi、Node 和 Bash 的实际来源。已有手动覆盖继续生效，清空覆盖即可恢复自动选择。
+
+在“设置与连接 → 通过 API 地址添加模型”中填写服务地址和 Key，点击“获取模型”，勾选后添加。支持根地址、`/v1` 地址和完整 `/models` 地址；根地址默认使用 `/v1`。Key 可留空以连接无需鉴权的本机服务。新模型合并到 Pi 的 `models.json`，保留已有配置并先备份；已添加模型自动跳过，同名服务的地址或密钥有变化时，可勾选“更新此服务的 API 地址和 Key”，或换用其他服务商 ID 另存；没有新增模型时也能只更新服务设置。底部“保存设置”会一并保存已选模型。保存错误会直接显示，预览过期会自动重取并保留选择；Windows UTF-8 BOM 配置和中文服务商 ID 均可使用。添加后可新建会话直接选择，或在当前会话空闲时点击“加载到当前会话”；其他任务继续运行。
+
+模型列表接口未提供思考能力时，新模型默认不启用思考。可在顶部思考菜单点击“配置思考能力”，或在设置的模型列表点击“思考能力”，根据服务说明启用思考及强度调节，无需重填 Key。强度调节对应 OpenAI 兼容服务的 `reasoning_effort` 参数，需服务商支持；未启用时显示由服务端控制。思考档位表示推理投入，实际生成速度由模型和服务商决定。保存后自动加载到当前使用该模型的空闲会话；其他会话重新加载或新建后生效。
 
 ## 从源码运行
 
@@ -79,10 +84,10 @@ npm run dist
 ## 数据与兼容性
 
 - Pi Web、终端和客户端默认共用 Pi 的 `models.json`、`auth.json`、`settings.json` 与历史。客户端偏好保存在 Electron 用户数据目录，凭据不会传给界面。
-- 修改模型配置后可在设置中重新读取；已连接的 Pi 进程在任务结束后重新连接，才会完整应用变化。
+- 修改模型配置后可在设置中重新读取，并在会话空闲时加载；运行中的任务继续使用原配置。
 - 每个打开的会话各自管理一个 Pi 进程，切换时后台任务继续执行。同一历史 JSONL 在客户端内复用已有进程；不要同时用其他入口写同一份会话。分支保留对话，不回滚项目文件。
 - 普通 RPC 扩展选择、确认、输入、编辑器和通知可用。依赖 TUI 绘制的扩展需要额外适配；Pi 0.84.2 的无超时启动交互可能阻塞 RPC 初始化。
-- 服务商登录与密钥配置目前使用 Pi 原有配置流程。模型能力、费用估算、认证与工具行为由 Pi 和服务商提供。
+- 服务商登录沿用 Pi 的配置流程，也可填写兼容服务的 API 地址和 Key 添加模型。模型能力、费用估算、认证与工具行为由 Pi 和服务商提供。
 - 工具使用当前系统用户权限操作所选项目；客户端不提供执行沙箱。
 - 当前 Windows 构建没有代码签名。
 
@@ -128,6 +133,9 @@ node scripts/run-restore-smoke.mjs
 
 # 真实长工具中立即调整、定向停止、取消自动继续及并行会话隔离
 node scripts/run-redirect-smoke.mjs
+
+# API 模型发现、导入合并、鉴权、同会话加载与真实模型调用
+node scripts/run-model-import-smoke.mjs
 ```
 
 输出报告与截图保存在 `output/`，不提交到仓库。可选的现有模型 / 项目验收说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。

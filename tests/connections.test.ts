@@ -72,6 +72,115 @@ function fixture(factoryDelay = 0) {
 const project = path.resolve('output/qa/parallel-fixture');
 const turn = () => new Promise(resolve => setTimeout(resolve, 10));
 
+test('model reload keeps chat identity and selection, waits for the old writer, and isolates late process events', async t => {
+  const clients: FixtureClient[] = [];
+  const events: RpcRecord[] = [];
+  const pool = new ConnectionPool({
+    createClient: (project, sessionPath, emit) => {
+      if (clients.length === 2) assert.equal(clients[0].stopped, true, 'old writer must exit before its replacement is created');
+      const client = new FixtureClient(project, sessionPath, emit, clients.length + 1);
+      client.state.model = { id: clients.length === 2 ? 'newly-imported-model' : 'original-model' };
+      clients.push(client);
+      return client;
+    },
+    onEvent: event => events.push(event),
+  });
+  t.after(() => pool.stopAll());
+  const a = await pool.connect(project);
+  const b = await pool.connect(project, undefined, { newSession: true });
+  await pool.rpc({ type: 'prompt', message: 'B must keep working' }, b.connectionId);
+  const entry = pool.get(a.connectionId);
+  const originalRevision = entry.revision;
+  const oldStop = clients[0].stop.bind(clients[0]);
+  let releaseStop!: () => Promise<void>;
+  clients[0].stop = () => new Promise<void>(resolve => { releaseStop = async () => { await oldStop(); resolve(); }; });
+  const reloading = pool.reloadModels(a.connectionId);
+  assert.equal(entry.revision, originalRevision + 1);
+  assert.equal(entry.mutation, true);
+  await turn();
+  assert.equal(clients.length, 2);
+  assert.equal(pool.activeConnectionId, b.connectionId);
+  assert.equal(pool.list().find(item => item.id === a.connectionId)?.busy, true);
+  await assert.rejects(pool.rpc({ type: 'prompt', message: 'cannot race refresh' }, a.connectionId), /切换设置/);
+  await assert.rejects(pool.reloadModels(a.connectionId), /正在执行/);
+  const reopening = pool.connect(project, a.state.sessionFile, { background: true });
+  await releaseStop();
+  const [refreshed, reused] = await Promise.all([reloading, reopening]);
+  assert.equal(refreshed.connectionId, a.connectionId);
+  assert.equal(reused.connectionId, a.connectionId);
+  assert.equal(pool.get(a.connectionId), entry);
+  assert.equal(refreshed.state.sessionFile, a.state.sessionFile);
+  assert.equal(refreshed.models[0].id, 'newly-imported-model');
+  assert.equal(entry.mutation, false);
+  assert.equal(pool.activeConnectionId, b.connectionId);
+  assert.equal(clients[1].busy, true);
+  assert.equal(clients[1].stopped, false);
+  const beforeLateEvents = events.length;
+  clients[0].emit({ type: 'connection_status', status: 'error', message: 'stale old process' });
+  clients[0].emit({ type: 'agent_start' });
+  clients[0].emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'stale' } });
+  assert.equal(events.length, beforeLateEvents, 'old process cannot corrupt the replacement view');
+  clients[2].emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'new process' } });
+  assert.equal(events.at(-1)?.connectionId, a.connectionId);
+  assert.equal(entry.status, 'connected');
+});
+
+test('model reload rejects active tasks and settings mutations without stopping any client', async t => {
+  const { pool, clients } = fixture();
+  t.after(() => pool.stopAll());
+  const a = await pool.connect(project);
+  await pool.rpc({ type: 'prompt', message: 'working' }, a.connectionId);
+  await assert.rejects(pool.reloadModels(a.connectionId), /正在执行/);
+  assert.equal(clients.length, 1);
+  assert.equal(clients[0].stopped, false);
+  assert.equal(clients[0].busy, true);
+  clients[0].finish();
+  const compact = pool.rpc({ type: 'compact' }, a.connectionId);
+  await assert.rejects(pool.reloadModels(a.connectionId), /正在执行/);
+  assert.equal(clients[0].stopped, false);
+  clients[0].compactRelease!(); await compact;
+  assert.equal(pool.get(a.connectionId).mutation, false);
+});
+
+test('model reload failure preserves the selected tab, and closing during refresh cannot start a replacement', async t => {
+  const clients: FixtureClient[] = [];
+  let failNext = false;
+  const pool = new ConnectionPool({
+    createClient: (project, sessionPath, emit) => {
+      if (failNext) { failNext = false; throw new Error('fixture model reload failed'); }
+      const client = new FixtureClient(project, sessionPath, emit, clients.length + 1);
+      clients.push(client); return client;
+    },
+    onEvent: () => {},
+  });
+  t.after(() => pool.stopAll());
+  const a = await pool.connect(project);
+  const b = await pool.connect(project, undefined, { newSession: true });
+  pool.select(a.connectionId!);
+  failNext = true;
+  await assert.rejects(pool.reloadModels(a.connectionId), /model reload failed/);
+  assert.equal(pool.activeConnectionId, a.connectionId, 'a failed refresh must not select another chat');
+  assert.equal(pool.list().length, 2);
+  assert.equal(pool.list().find(item => item.id === a.connectionId)?.status, 'error');
+  assert.equal(pool.list().find(item => item.id === a.connectionId)?.busy, false);
+  assert.equal(clients[1].stopped, false);
+  const recovered = await pool.connect(project, a.state.sessionFile, { connectionId: a.connectionId });
+  assert.equal(recovered.connectionId, a.connectionId);
+  const oldStop = clients[2].stop.bind(clients[2]);
+  let releaseStop!: () => Promise<void>;
+  let waitingStop: Promise<void> | undefined;
+  clients[2].stop = () => waitingStop ??= new Promise<void>(resolve => { releaseStop = async () => { await oldStop(); resolve(); }; });
+  const reloading = pool.reloadModels(a.connectionId);
+  const rejected = assert.rejects(reloading, /刷新已取消/);
+  await turn();
+  const closing = pool.disconnect(a.connectionId);
+  await releaseStop();
+  await Promise.all([rejected, closing]);
+  assert.equal(clients.length, 3, 'closing cannot launch a new writer after the old client exits');
+  assert.deepEqual(pool.list().map(item => item.id), [b.connectionId]);
+  assert.equal(clients[1].stopped, false);
+});
+
 test('immediate redirect waits for real idle, supersedes older requests and deduplicates identical sends in one chat', async t => {
   const { pool, clients, events } = fixture();
   t.after(() => pool.stopAll());

@@ -1,0 +1,59 @@
+.model-import { min-width: 0; }
+.model-import-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 13px 12px; }
+.model-import-form .form-label { display: block; min-width: 0; margin: 0; line-height: 1.6; }
+.model-import-form .form-label:first-child, .model-import-fetch { grid-column: 1 / -1; }
+.model-import-form .form-input { display: block; margin-top: 7px; font-size: 12px; padding: 10px 11px; }
+.model-import-optional { margin-left: 4px; color: var(--muted); font-size: 10px; }
+.model-import-field-help { display: block; margin-top: 5px; color: var(--muted); font-size: 10px; line-height: 1.6; }
+.model-import-fetch, .model-import-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 13px; }
+.model-import-fetch > span, .model-import-actions > span { flex: 1; color: var(--muted); font-size: 10px; line-height: 1.7; }
+.model-import-fetch .button, .model-import-actions .button { flex-shrink: 0; }
+.model-import-loading { display: flex; align-items: center; gap: 8px; margin-top: 15px; color: var(--secondary); font-size: 11px; }
+.model-import-preview { margin-top: 17px; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }
+.model-import-summary { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 12px; background: var(--soft); }
+.model-import-summary > span:first-child { min-width: 0; }
+.model-import-summary strong { display: block; font-size: 12px; font-weight: 550; overflow-wrap: anywhere; }
+.model-import-summary small { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.6; overflow-wrap: anywhere; }
+.model-import-count { flex-shrink: 0; color: var(--muted); font-size: 10px; line-height: 1.7; }
+.model-import-service { padding: 11px 12px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); background: var(--soft); }
+.model-import-service.conflict { background: var(--purple-soft); }
+.model-import-service p { margin: 0 0 9px; color: var(--secondary); font-size: 11px; line-height: 1.8; overflow-wrap: anywhere; }
+.model-import-service > small { display: block; margin: 7px 0 0 22px; color: var(--muted); font-size: 10px; line-height: 1.7; }
+.model-import-update { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 11px; line-height: 1.7; cursor: pointer; }
+.model-import-update input { accent-color: var(--purple); margin: 0; flex-shrink: 0; }
+.model-import-new-provider.text-button { margin-top: 9px; color: var(--purple); font-size: 11px; text-align: left; }
+.model-import-search { display: flex; align-items: center; gap: 8px; margin: 11px 12px 8px; border: 1px solid var(--border); border-radius: 7px; padding: 7px 9px; color: var(--muted); }
+.model-import-search input { min-width: 0; flex: 1; height: 22px; border: 0; background: transparent; color: var(--text); font-size: 12px; }
+.model-import-search input::-webkit-search-cancel-button { display: none; }
+.model-import-search button { display: flex; padding: 2px; background: transparent; color: var(--muted); border: 0; border-radius: 4px; }
+.model-import-search button:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.model-import-selection { display: flex; align-items: center; justify-content: space-between; gap: 9px; padding: 7px 12px 10px; color: var(--secondary); font-size: 11px; }
+.model-import-selection label { display: flex; align-items: center; gap: 8px; }
+.model-import-selection > span { color: var(--muted); font-size: 10px; }
+.model-import-selection input, .model-import-model input { accent-color: var(--purple); margin: 0; flex-shrink: 0; }
+.model-import-list { max-height: min(280px, 33vh); min-height: 48px; overflow-y: auto; overscroll-behavior: contain; border-top: 1px solid var(--border); }
+.model-import-model { display: flex; align-items: center; gap: 10px; padding: 11px 12px; min-height: 46px; cursor: pointer; }
+.model-import-model + .model-import-model { border-top: 1px solid var(--border); }
+.model-import-model:hover { background: var(--soft); }
+.model-import-model.existing { cursor: default; }
+.model-import-model-text { flex: 1; min-width: 0; }
+.model-import-model-text strong { display: block; color: var(--text); font-size: 12px; font-weight: 450; line-height: 1.5; overflow-wrap: anywhere; }
+.model-import-model-text small { display: block; color: var(--muted); font-size: 10px; margin-top: 3px; line-height: 1.5; overflow-wrap: anywhere; }
+.model-import-existing { flex-shrink: 0; color: var(--muted); font-size: 10px; padding: 2px 6px; border: 1px solid var(--border); border-radius: 4px; }
+.model-import-actions { border-top: 1px solid var(--border); padding: 11px 12px; }
+.model-import-empty { padding: 21px 14px; color: var(--muted); font-size: 11px; line-height: 1.8; text-align: center; }
+.model-import-feedback { display: flex; align-items: flex-start; gap: 8px; margin-top: 15px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--soft); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.model-import-feedback > svg { flex-shrink: 0; margin-top: 2px; }
+.model-import-feedback:focus { outline: 2px solid color-mix(in srgb, var(--purple) 45%, transparent); outline-offset: 2px; }
+.model-import-info { color: var(--secondary); }
+.model-import-error { color: #b05f52; }
+.model-import-success { color: var(--green); }
+.model-import-success strong { font-weight: 500; }
+.model-import-success small { display: block; margin-top: 4px; color: var(--secondary); font-size: 11px; }
+.model-import-success code { display: block; margin-top: 5px; color: var(--muted); font-size: 10px; line-height: 1.7; overflow-wrap: anywhere; }
+@media (max-width: 540px) {
+  .model-import-form { grid-template-columns: minmax(0, 1fr); }
+  .model-import-summary { flex-direction: column; gap: 6px; }
+  .model-import-fetch > span, .model-import-actions > span { flex-basis: 100%; }
+  .model-import-fetch .button, .model-import-actions .button { margin-left: auto; }
+}

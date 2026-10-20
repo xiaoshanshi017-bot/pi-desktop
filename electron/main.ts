@@ -8,11 +8,12 @@ import { desktopProgressGuidance } from '../shared/progress-guidance';
 import { discoverDiagnostics } from './diagnostics';
 import { createPiLaunchOptions } from './runtime';
 import { readModelConfigSummary } from './model-config';
+import { ModelImportService } from './model-import';
 import { importProjects, previewProjectMigration } from './project-migration';
 import { resolveSessionRestore } from './session-restore';
 import { ConnectionPool, type ManagedConnection } from './connections';
 import { PiRpcClient } from './rpc';
-import { listSessions, PreferenceStore, readSessionHeader, readSessionInfo, samePath } from './storage';
+import { agentDir, listSessions, PreferenceStore, readSessionHeader, readSessionInfo, samePath } from './storage';
 import { WorkspaceStore } from './workspace-store';
 
 if (process.env.PI_DESKTOP_USER_DATA) app.setPath('userData', resolve(process.env.PI_DESKTOP_USER_DATA));
@@ -25,6 +26,7 @@ let store: PreferenceStore;
 let workspaceStore: WorkspaceStore;
 let workspaceFrozen = false;
 let pendingWorkspaceFlush: { id: string; done(): void } | undefined;
+const modelImporter = new ModelImportService();
 const expectedVersion = '0.84.2';
 const devUrl = process.env.PI_DESKTOP_DEV_URL;
 const runtimeRoot = app.isPackaged ? join(process.resourcesPath, 'runtime') : join(app.getAppPath(), 'build', 'runtime', 'win32-x64');
@@ -45,7 +47,10 @@ function publicModel(model: RpcRecord | undefined | null): RpcRecord | null {
   // Custom provider definitions may contain authentication headers. The renderer
   // needs display metadata only; Pi alone owns provider credentials and transport.
   const fields = ['id', 'name', 'api', 'provider', 'reasoning', 'input', 'contextWindow', 'maxTokens', 'cost'];
-  return Object.fromEntries(fields.filter(key => model[key] !== undefined).map(key => [key, model[key]]));
+  return {
+    ...Object.fromEntries(fields.filter(key => model[key] !== undefined).map(key => [key, model[key]])),
+    ...(typeof model.compat?.supportsReasoningEffort === 'boolean' ? { supportsReasoningEffort: model.compat.supportsReasoningEffort } : {}),
+  };
 }
 function publicRpcData(command: string, data: RpcRecord): RpcRecord {
   if (command === 'set_model') return publicModel(data) ?? {};
@@ -232,6 +237,34 @@ function registerIpc(): void {
     if (!Array.isArray(value) || value.some(path => typeof path !== 'string' || !isAbsolute(path) || !path.trim() || path.length > 32_768)) throw new Error('待导入项目路径无效。');
     return importProjects(value, store);
   });
+  handle('pi:previewModels', async value => {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['url', 'apiKey', 'provider'].includes(key))) throw new Error('模型接口格式无效。');
+    const url = text(value.url, 'API 地址', 4096);
+    if (value.apiKey !== undefined && (typeof value.apiKey !== 'string' || value.apiKey.length > 8192)) throw new Error('API Key 格式无效。');
+    const provider = value.provider === undefined || value.provider === '' ? undefined : text(value.provider, '服务商名称', 64);
+    if (provider && (!/^[a-zA-Z0-9\u4e00-\u9fff._-]{1,64}$/.test(provider) || ['__proto__', 'constructor', 'prototype'].includes(provider))) throw new Error('服务商名称请使用 1–64 个中英文字母、数字、点、横线或下划线。');
+    const preview = await modelImporter.preview({ baseUrl: url, apiKey: value.apiKey });
+    try {
+      const selectedProvider = provider || preview.provider;
+      const summary = await readModelConfigSummary(agentDir());
+      if (summary.error) throw new Error('当前模型配置无法读取，请先修复 models.json，再添加模型。');
+      const target = await modelImporter.describeTarget(agentDir(), preview.token, selectedProvider);
+      const existing = new Set(summary.models.filter(model => model.provider === selectedProvider).map(model => model.id));
+      return { ...preview, ...target, provider: selectedProvider, models: preview.models.map(model => ({ ...model, exists: existing.has(model.id) })) };
+    } catch (error) { modelImporter.discard(preview.token); throw error; }
+  });
+  handle('pi:importModels', async value => {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['token', 'provider', 'modelIds', 'updateExisting'].includes(key))) throw new Error('模型导入格式无效。');
+    const result = await modelImporter.save(agentDir(), value);
+    return { ...result, summary: await readModelConfigSummary(agentDir()) };
+  });
+  handle('pi:configureModelReasoning', async value => {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['provider', 'modelId', 'reasoning', 'supportsReasoningEffort'].includes(key))) throw new Error('思考能力设置格式无效。');
+    const result = await modelImporter.configureReasoning(agentDir(), value);
+    return { ...result, summary: await readModelConfigSummary(agentDir()) };
+  });
+  handle('pi:discardModelPreview', value => { modelImporter.discard(text(value, '模型预览', 100)); });
+  handle('pi:reloadModels', async value => publicConnection(await connections.reloadModels(connectionId(value))));
   handle('pi:connect', connect);
   handle('pi:activateConnection', async value => {
     const result = await connections.activate(text(value, '连接 ID', 200));

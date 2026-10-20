@@ -48,6 +48,7 @@ export class ConnectionPool {
   private activeId?: string;
   private selectionOrder = 0;
   private stopping = false;
+  private clientGenerations = new WeakMap<ManagedConnection, number>();
   constructor(private readonly options: ConnectionPoolOptions) {}
   get activeConnectionId(): string | undefined { return this.activeId; }
   isLatestSelection(entry: ManagedConnection): boolean {
@@ -159,10 +160,14 @@ export class ConnectionPool {
     try { return await entry.connecting; }
     finally { entry.connecting = undefined; this.changed(); }
   }
-  private async start(entry: ManagedConnection): Promise<Connection> {
+  private async start(entry: ManagedConnection, retainOnFailure = false): Promise<Connection> {
+    const generation = (this.clientGenerations.get(entry) ?? 0) + 1;
+    this.clientGenerations.set(entry, generation);
     this.emit(entry, { type: 'connection_status', status: 'connecting' });
     try {
-      entry.client = await this.options.createClient(entry.project, entry.sessionPath, event => this.emit(entry, event));
+      entry.client = await this.options.createClient(entry.project, entry.sessionPath, event => {
+        if (this.clientGenerations.get(entry) === generation) this.emit(entry, event);
+      });
       if (entry.closing || this.stopping) throw new Error('连接已取消。');
       entry.client.start();
       const result = await this.snapshot(entry);
@@ -170,9 +175,11 @@ export class ConnectionPool {
       return result;
     } catch (error) {
       await entry.client?.stop();
-      this.emit(entry, { type: 'connection_status', status: 'error', message: (error as Error).message });
-      this.entries.delete(entry.id);
-      if (this.activeId === entry.id) this.activeId = this.fallbackActive();
+      if (!entry.closing || !retainOnFailure) this.emit(entry, { type: 'connection_status', status: 'error', message: (error as Error).message });
+      if (!retainOnFailure) {
+        this.entries.delete(entry.id);
+        if (this.activeId === entry.id) this.activeId = this.fallbackActive();
+      }
       this.changed();
       throw error;
     }
@@ -190,6 +197,42 @@ export class ConnectionPool {
     this.select(id);
     const entry = this.entries.get(id)!;
     return entry.connecting ?? this.snapshot(entry);
+  }
+  /** Reload disk model definitions without changing this chat's identity or selection. */
+  async reloadModels(id?: string): Promise<Connection> {
+    if (this.stopping) throw new Error('Pi Desktop 正在退出。');
+    const entry = this.get(id);
+    this.assertIdle(entry);
+    const client = entry.client!;
+    entry.revision++;
+    entry.mutation = true;
+    entry.mutationType = 'reload_models';
+    let finishMutation!: () => void;
+    entry.mutationDone = new Promise<void>(resolve => { finishMutation = resolve; });
+    // Ignore late events from the old process, including its normal disconnect.
+    // Session revisions also change within one process, so use a separate generation.
+    this.clientGenerations.set(entry, (this.clientGenerations.get(entry) ?? 0) + 1);
+    const reloading = Promise.resolve().then(async () => {
+      this.emit(entry, { type: 'connection_status', status: 'connecting' });
+      try { await client.stop(); }
+      catch (error) {
+        if (!entry.closing) this.emit(entry, { type: 'connection_status', status: 'error', message: (error as Error).message });
+        throw error;
+      }
+      if (entry.closing || this.stopping || this.entries.get(entry.id) !== entry) throw new Error('模型刷新已取消。');
+      return this.start(entry, true);
+    });
+    entry.connecting = reloading;
+    this.changed();
+    try { return await reloading; }
+    finally {
+      entry.connecting = undefined;
+      entry.mutation = false;
+      entry.mutationType = undefined;
+      entry.mutationDone = undefined;
+      finishMutation();
+      this.changed();
+    }
   }
   private fallbackActive(): string | undefined {
     return [...this.entries.values()].filter(entry => !entry.closing && (entry.connecting || entry.client?.running)).sort((a, b) => b.selectionOrder - a.selectionOrder)[0]?.id;

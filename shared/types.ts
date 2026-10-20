@@ -7,8 +7,14 @@ export interface SessionInfo { path: string; id: string; cwd: string; name?: str
 export interface Preferences { projects: Project[]; lastProject?: string; piPath?: string; nodePath?: string; theme: 'light' | 'dark'; lastSessions?: Record<string, string> }
 export type RuntimeSource = 'bundled' | 'system' | 'custom';
 export interface Diagnostics { piPath: string | null; piVersion: string | null; nodePath: string | null; nodeVersion: string | null; bashPath: string | null; agentDir: string; errors: string[]; piSource?: RuntimeSource; nodeSource?: RuntimeSource; bashSource?: RuntimeSource; runtimeRoot?: string; warnings?: string[] }
-export interface ConfiguredModel { provider: string; id: string; name: string }
+export interface ConfiguredModel { provider: string; id: string; name: string; api?: string; reasoning?: boolean; supportsReasoningEffort?: boolean }
 export interface ModelConfigSummary { source: string; models: ConfiguredModel[]; defaultProvider?: string; defaultModel?: string; defaultThinkingLevel?: string; error?: string }
+export interface ModelPreviewInput { url: string; apiKey?: string; provider?: string }
+export interface ModelImportPreview { token: string; baseUrl: string; provider: string; models: Array<{ id: string; name: string; exists?: boolean; reasoning?: boolean }>; expiresAt: number; providerExists?: boolean; conflicts?: Array<'baseUrl' | 'apiKey' | 'api'>; suggestedProvider?: string }
+export interface ModelImportInput { token: string; provider: string; modelIds: string[]; updateExisting?: boolean }
+export interface ModelImportResult { provider: string; source: string; backup?: string; added: number; skipped: number; summary: ModelConfigSummary; updated?: boolean; changedFields?: string[] }
+export interface ModelReasoningInput { provider: string; modelId: string; reasoning: boolean; supportsReasoningEffort: boolean }
+export interface ModelReasoningResult { provider: string; modelId: string; source: string; backup?: string; changed: boolean; summary: ModelConfigSummary }
 export interface CachedConversationTab {
   id: string; project: string; sessionPath?: string; lastActivity: number; unread: boolean;
   view: RpcRecord;
@@ -31,6 +37,11 @@ export interface PiDesktopApi {
   chooseProject(): Promise<string | null>;
   previewProjectMigration(): Promise<ProjectMigrationPreview>;
   importProjects(paths: string[]): Promise<ProjectMigrationResult>;
+  previewModels(input: ModelPreviewInput): Promise<ModelImportPreview>;
+  importModels(input: ModelImportInput): Promise<ModelImportResult>;
+  configureModelReasoning(input: ModelReasoningInput): Promise<ModelReasoningResult>;
+  discardModelPreview(token: string): Promise<void>;
+  reloadModels(connectionId?: string): Promise<Connection>;
   connect(project: string, sessionPath?: string, options?: ConnectOptions): Promise<Connection>;
   activateConnection(id: string): Promise<Connection>;
   selectConnection(id: string): Promise<ConnectionSummary>;

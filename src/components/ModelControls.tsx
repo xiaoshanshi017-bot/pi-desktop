@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { createPortal } from 'react-dom';
 import { Check, ChevronDown, Search, Sparkles, X, Zap } from 'lucide-react';
 import type { RpcRecord } from '../../shared/types';
+import './ModelReasoning.css';
 
 const thinkingLabels: Record<string, string> = { off: '关闭思考', minimal: '极简思考', low: '轻度思考', medium: '标准思考', high: '深度思考', xhigh: '更深思考', max: '最大思考' };
 const thinkingEnglish: Record<string, string> = { off: 'Off', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'XHigh', max: 'Max' };
@@ -28,9 +29,10 @@ interface ModelControlsProps {
   project: string;
   onModelChange: (key: string) => void;
   onThinkingChange: (level: string) => void;
+  onConfigureReasoning?: () => void;
 }
 
-export function ModelControls({ models, modelKey, model, levels, thinkingLevel, disabled, ready, project, onModelChange, onThinkingChange }: ModelControlsProps) {
+export function ModelControls({ models, modelKey, model, levels, thinkingLevel, disabled, ready, project, onModelChange, onThinkingChange, onConfigureReasoning }: ModelControlsProps) {
   const [open, setOpen] = useState<Picker | null>(null);
   const [query, setQuery] = useState('');
   const [activeKey, setActiveKey] = useState('');
@@ -40,6 +42,7 @@ export function ModelControls({ models, modelKey, model, levels, thinkingLevel, 
   const panel = useRef<HTMLDivElement>(null);
   const search = useRef<HTMLInputElement>(null);
   const thinkingList = useRef<HTMLDivElement>(null);
+  const configureThinking = useRef<HTMLButtonElement>(null);
   const focusAfterSelection = useRef<HTMLButtonElement | null>(null);
   const id = useId().replace(/:/g, '');
   const modelListId = `model-list-${id}`;
@@ -58,11 +61,16 @@ export function ModelControls({ models, modelKey, model, levels, thinkingLevel, 
   const flatModels = useMemo(() => groups.flatMap(group => group.entries), [groups]);
   const modelKeys = useMemo(() => flatModels.map(item => `${item.provider}/${item.id}`), [flatModels]);
   const allModelKeys = useMemo(() => [...new Set(models.map(item => item.provider))].flatMap(provider => models.filter(item => item.provider === provider).map(item => `${item.provider}/${item.id}`)), [models]);
-  const keys = open === 'model' ? modelKeys : levels;
+  const reasoningDisabled = Boolean(model && model.reasoning !== true);
+  const serverControlled = Boolean(onConfigureReasoning && model?.reasoning === true && model.supportsReasoningEffort === false);
+  const thinkingOptions = serverControlled ? [] : levels;
+  const keys = open === 'model' ? modelKeys : thinkingOptions;
   const activeIndex = keys.indexOf(activeKey);
   const activeOptionId = activeIndex >= 0 ? `${open}-option-${id}-${activeIndex}` : undefined;
   const positioned = position !== null;
   const displayName = model?.name || model?.id || (ready ? '请选择模型' : '连接后选择模型');
+  const thinkingLabel = reasoningDisabled ? '未启用思考' : serverControlled ? '服务端控制' : thinkingLabels[thinkingLevel] || thinkingLevel;
+  const thinkingLabelEnglish = reasoningDisabled || serverControlled ? '' : thinkingEnglish[thinkingLevel] || thinkingLevel;
 
   const close = useCallback((restoreFocus = false) => {
     if (restoreFocus) (open === 'model' ? modelTrigger : thinkingTrigger).current?.focus();
@@ -71,7 +79,7 @@ export function ModelControls({ models, modelKey, model, levels, thinkingLevel, 
 
   const show = (picker: Picker, boundary?: 'first' | 'last', initialQuery = '') => {
     if (disabled) return;
-    const options = picker === 'model' ? allModelKeys : levels;
+    const options = picker === 'model' ? allModelKeys : thinkingOptions;
     const selected = picker === 'model' ? modelKey : thinkingLevel;
     setQuery(initialQuery); setPosition(null); setOpen(picker);
     setActiveKey(boundary === 'first' ? options[0] || '' : boundary === 'last' ? options[options.length - 1] || '' : options.includes(selected) ? selected : options[0] || '');
@@ -90,9 +98,14 @@ export function ModelControls({ models, modelKey, model, levels, thinkingLevel, 
     if (event.nativeEvent.isComposing) return;
     if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(true); return; }
     if (event.key === 'Tab') {
+      if (open === 'thinking' && onConfigureReasoning) {
+        if (!event.shiftKey && event.target !== configureThinking.current) { event.preventDefault(); configureThinking.current?.focus(); return; }
+        if (event.shiftKey && event.target === configureThinking.current) { event.preventDefault(); thinkingList.current?.focus(); return; }
+      }
       // Restore the trigger before the browser performs its normal Tab movement.
       close(true); return;
     }
+    if (event.target === configureThinking.current) return;
     if (!keys.length) return;
     let index = activeIndex;
     if (event.key === 'ArrowDown') index = (index + 1) % keys.length;
@@ -179,7 +192,7 @@ export function ModelControls({ models, modelKey, model, levels, thinkingLevel, 
   return <>
     <button id="model-select" ref={modelTrigger} className={`model-picker-trigger ${open === 'model' ? 'picker-open' : ''}`} type="button" aria-label={`选择模型：${displayName}`} aria-haspopup="listbox" aria-expanded={open === 'model'} aria-controls={open === 'model' ? modelListId : undefined} disabled={disabled} title={model ? `${displayName}\n${model.provider} / ${model.id}` : displayName} onClick={() => open === 'model' ? close(true) : show('model')} onKeyDown={event => onTriggerKeyDown('model', event)}><span className="model-spark"><Sparkles size={14} /></span><span className="model-picker-current-name">{displayName}</span>{model?.provider && <span className="model-provider-badge">{model.provider}</span>}<ChevronDown size={13} className="picker-chevron" /></button>
     <span className="toolbar-divider" />
-    <button ref={thinkingTrigger} className={`thinking-picker-trigger ${open === 'thinking' ? 'picker-open' : ''}`} type="button" aria-label={`思考强度 Reasoning：${thinkingLabels[thinkingLevel] || thinkingLevel} ${thinkingEnglish[thinkingLevel] || thinkingLevel}`} aria-haspopup="listbox" aria-expanded={open === 'thinking'} aria-controls={open === 'thinking' ? thinkingListId : undefined} disabled={disabled} onClick={() => open === 'thinking' ? close(true) : show('thinking')} onKeyDown={event => onTriggerKeyDown('thinking', event)}><Zap size={14} /><span className="thinking-picker-current"><span>{thinkingLabels[thinkingLevel] || thinkingLevel}</span><small className="thinking-label-en">{thinkingEnglish[thinkingLevel] || thinkingLevel}</small></span><ChevronDown size={12} className="picker-chevron" /></button>
+    <button ref={thinkingTrigger} className={`thinking-picker-trigger ${open === 'thinking' ? 'picker-open' : ''}`} type="button" aria-label={`思考强度 Reasoning：${thinkingLabel}${thinkingLabelEnglish ? ` ${thinkingLabelEnglish}` : ''}`} aria-haspopup="listbox" aria-expanded={open === 'thinking'} aria-controls={open === 'thinking' ? thinkingListId : undefined} disabled={disabled} onClick={() => open === 'thinking' ? close(true) : show('thinking')} onKeyDown={event => onTriggerKeyDown('thinking', event)}><Zap size={14} /><span className="thinking-picker-current"><span>{thinkingLabel}</span>{thinkingLabelEnglish && <small className="thinking-label-en">{thinkingLabelEnglish}</small>}</span><ChevronDown size={12} className="picker-chevron" /></button>
     {open && createPortal(<div ref={panel} className={`picker-panel ${open === 'model' ? 'model-picker-panel' : 'thinking-picker-panel'}`} style={position ? { ...position, visibility: 'visible' } : { visibility: 'hidden' }} onKeyDown={onMenuKeyDown}>
       {open === 'model' ? <>
         <div className="picker-panel-heading"><span>选择模型</span><small>{models.length} 个可用模型</small></div>
@@ -193,8 +206,8 @@ export function ModelControls({ models, modelKey, model, levels, thinkingLevel, 
         <div className="picker-keyboard-hint"><span><kbd>↑</kbd><kbd>↓</kbd> 选择</span><span><kbd>Enter</kbd> 确认</span><span><kbd>Esc</kbd> 关闭</span></div>
       </> : <>
         <div className="picker-panel-heading thinking-picker-heading"><span>思考强度<small className="thinking-title-en">Reasoning</small></span><small>按任务复杂度调整</small></div>
-        <div ref={thinkingList} id={thinkingListId} className="thinking-picker-list picker-options" role="listbox" aria-label="可用思考强度 Reasoning" aria-activedescendant={activeOptionId} tabIndex={-1}>{levels.map((level, index) => <button key={level} id={`thinking-option-${id}-${index}`} type="button" className={`thinking-picker-option picker-option ${activeKey === level ? 'keyboard-active' : ''} ${thinkingLevel === level ? 'selected' : ''}`} data-level={level} role="option" aria-label={`${thinkingLabels[level] || level} ${thinkingEnglish[level] || level}：${thinkingDescriptions[level] || '使用模型提供的此档思考强度'}`} aria-selected={thinkingLevel === level} tabIndex={-1} onMouseMove={() => setActiveKey(level)} onClick={() => select(level)}><span className={`thinking-option-icon ${level === 'off' ? 'thinking-off' : ''}`}><Zap size={16} /></span><span className="thinking-option-text"><strong><span>{thinkingLabels[level] || level}</span><span className="thinking-label-en">{thinkingEnglish[level] || level}</span></strong><small>{thinkingDescriptions[level] || '使用模型提供的此档思考强度'}</small></span>{thinkingLevel === level && <Check size={16} className="picker-selected-check" />}</button>)}</div>
-        <div className="thinking-picker-note">可选档位由当前模型提供。</div>
+        <div ref={thinkingList} id={thinkingListId} className="thinking-picker-list picker-options" role="listbox" aria-label="可用思考强度 Reasoning" aria-activedescendant={activeOptionId} tabIndex={-1}>{thinkingOptions.map((level, index) => <button key={level} id={`thinking-option-${id}-${index}`} type="button" className={`thinking-picker-option picker-option ${activeKey === level ? 'keyboard-active' : ''} ${thinkingLevel === level ? 'selected' : ''}`} data-level={level} role="option" aria-label={`${thinkingLabels[level] || level} ${thinkingEnglish[level] || level}：${thinkingDescriptions[level] || '使用模型提供的此档思考强度'}`} aria-selected={thinkingLevel === level} tabIndex={-1} onMouseMove={() => setActiveKey(level)} onClick={() => select(level)}><span className={`thinking-option-icon ${level === 'off' ? 'thinking-off' : ''}`}><Zap size={16} /></span><span className="thinking-option-text"><strong><span>{thinkingLabels[level] || level}</span><span className="thinking-label-en">{thinkingEnglish[level] || level}</span></strong><small>{thinkingDescriptions[level] || '使用模型提供的此档思考强度'}</small></span>{thinkingLevel === level && <Check size={16} className="picker-selected-check" />}</button>)}</div>
+        <div className="thinking-picker-note">{reasoningDisabled ? `当前模型配置未启用思考能力。${onConfigureReasoning ? '如果服务商支持，可在下方启用。' : ''}` : serverControlled ? '此服务未启用思考强度参数，强度由服务商控制。' : '思考档位控制推理投入，实际速度由服务商和模型决定。'}{onConfigureReasoning && <button ref={configureThinking} type="button" className="thinking-configure-button" onClick={() => { close(true); onConfigureReasoning(); }}>配置思考能力</button>}</div>
       </>}
     </div>, document.body)}
   </>;

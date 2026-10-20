@@ -1,0 +1,24 @@
+.thinking-configure-button { display: block; margin-top: 9px; padding: 0; border: 0; background: transparent; color: var(--purple); font-size: 11px; text-align: left; }
+.thinking-configure-button:hover { text-decoration: underline; }
+.thinking-configure-button:focus-visible { outline: 2px solid var(--purple); outline-offset: 4px; border-radius: 2px; }
+.modal-backdrop.model-reasoning-backdrop { z-index: 45; }
+.model-reasoning-dialog { width: 470px; }
+.model-reasoning-dialog h2 { display: flex; align-items: center; gap: 9px; }
+.model-reasoning-dialog h2 > svg { color: var(--purple); }
+.model-reasoning-dialog .modal-body { min-height: 0; }
+.model-reasoning-dialog > header, .model-reasoning-dialog > footer { flex-shrink: 0; }
+.model-reasoning-model strong { display: block; color: var(--text); font-size: 13px; font-weight: 550; overflow-wrap: anywhere; }
+.model-reasoning-model small { display: block; margin-top: 6px; color: var(--muted); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.model-reasoning-description, .model-reasoning-note { color: var(--secondary); font-size: 12px; line-height: 1.8; }
+.model-reasoning-description { margin: 15px 0 18px; }
+.model-reasoning-option { display: flex; align-items: flex-start; gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
+.model-reasoning-option + .model-reasoning-option { margin-top: 10px; }
+.model-reasoning-option input { flex-shrink: 0; margin: 3px 0 0; accent-color: var(--purple); }
+.model-reasoning-option strong { display: block; color: var(--text); font-size: 12px; font-weight: 500; line-height: 1.7; }
+.model-reasoning-option small { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.7; }
+.model-reasoning-option.inactive { opacity: .6; cursor: default; }
+.model-reasoning-note { margin: 15px 0 0; padding: 10px 12px; border-radius: 7px; background: var(--soft); color: var(--muted); font-size: 11px; }
+.model-reasoning-error { display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 7px; color: #b05f52; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.model-reasoning-error > svg { flex-shrink: 0; margin-top: 2px; }
+.model-reasoning-error:focus { outline: 2px solid color-mix(in srgb, var(--purple) 45%, transparent); outline-offset: 2px; }
+@media (max-width: 540px) { .modal-backdrop.model-reasoning-backdrop { padding: 14px; } .model-reasoning-dialog > header, .model-reasoning-dialog .modal-body, .model-reasoning-dialog > footer { padding-left: 17px; padding-right: 17px; } }
